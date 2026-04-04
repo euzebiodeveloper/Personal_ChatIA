@@ -10,6 +10,7 @@ export interface AIResponse {
 export interface ElectronAPI {
   // Renderer → Main
   sendTranscription: (text: string) => Promise<AIResponse>;
+  transcribeAudio: (buffer: ArrayBuffer) => Promise<string>;
   onReady: () => void;
   getModelsPath: () => Promise<string>;
   writeLog: (level: 'info' | 'warn' | 'error', msg: string) => void;

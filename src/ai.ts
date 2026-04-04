@@ -43,6 +43,16 @@ Para conversa normal (sem ação), responda como texto normal. Seja breve e simp
 type Message = { role: 'user' | 'assistant'; content: string };
 const history: Message[] = [];
 
+export async function transcribeAudio(buffer: Buffer): Promise<string> {
+  const file = new File([new Uint8Array(buffer)], 'audio.webm', { type: 'audio/webm' });
+  const result = await getClient().audio.transcriptions.create({
+    file,
+    model: 'whisper-large-v3-turbo',
+    // No language forced — auto-detects pt-BR and en
+  });
+  return result.text.trim();
+}
+
 export async function processTranscription(
   text: string,
   win: BrowserWindow,
@@ -80,7 +90,6 @@ export async function processTranscription(
           speechText = parsed.speech;
           actionTaken = parsed.action;
 
-          win.webContents.send('character-state', 'talking');
           await executeAction(parsed.action, parsed.params);
         }
       } catch {
@@ -89,9 +98,10 @@ export async function processTranscription(
     }
 
     win.webContents.send('show-message', speechText);
-    win.webContents.send('character-state', 'talking');
 
-    await speak(speechText);
+    await speak(speechText, () => {
+      win.webContents.send('character-state', 'talking');
+    });
 
     win.webContents.send('character-state', 'idle');
     return { text: speechText, action: actionTaken };

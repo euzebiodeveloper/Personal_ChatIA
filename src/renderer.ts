@@ -1,7 +1,6 @@
 import './index.css';
 import { AnimatedCharacter } from './character';
 import { VadRecorder } from './recorder';
-import { transcribe } from './stt';
 import type { CharacterState } from './types';
 
 let character: AnimatedCharacter;
@@ -64,11 +63,12 @@ async function handleSpeech(blob: Blob): Promise<void> {
   isProcessing = true;
   character.setState('listening');
 
-  // Step 1: transcribe
+  // Step 1: transcribe via Groq Whisper API
   let text: string;
   try {
+    const arrayBuffer = await blob.arrayBuffer();
     window.electronAPI.writeLog('info', `[step2] transcribing blob size=${blob.size}`);
-    text = await transcribe(blob, () => {});
+    text = await window.electronAPI.transcribeAudio(arrayBuffer);
     window.electronAPI.writeLog('info', `[step2] result: "${text}"`);
   } catch (err) {
     const msg = err instanceof Error ? `${err.message}\nstack: ${(err as Error).stack}` : String(err);

@@ -16,7 +16,7 @@ function getPiperDir(): string {
   return path.join(app.getAppPath(), 'assets', 'piper');
 }
 
-export function speak(text: string): Promise<void> {
+export function speak(text: string, onPlaybackStart?: () => void): Promise<void> {
   return new Promise((resolve) => {
     stopSpeaking();
 
@@ -43,6 +43,9 @@ export function speak(text: string): Promise<void> {
         resolve();
         return;
       }
+
+      // Notify caller that audio is about to start (lip sync trigger)
+      onPlaybackStart?.();
 
       // Play WAV via PowerShell SoundPlayer — path passed via env to avoid quoting issues
       currentPlayer = spawn(

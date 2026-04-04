@@ -6,6 +6,9 @@ const api: ElectronAPI = {
   sendTranscription: (text: string) =>
     ipcRenderer.invoke('process-transcription', text) as Promise<AIResponse>,
 
+  transcribeAudio: (buffer: ArrayBuffer) =>
+    ipcRenderer.invoke('transcribe-audio', buffer) as Promise<string>,
+
   onReady: () => ipcRenderer.send('renderer-ready'),
 
   getModelsPath: () => ipcRenderer.invoke('get-models-path') as Promise<string>,

@@ -1,4 +1,4 @@
-import * as PIXI from 'pixi.js';
+﻿import * as PIXI from 'pixi.js';
 import { Live2DModel } from 'pixi-live2d-display/cubism4';
 
 // pixi-live2d-display requires PIXI on the window object
