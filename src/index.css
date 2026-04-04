@@ -1,0 +1,88 @@
+/* ── Reset ─────────────────────────────────────────────────────── */
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: transparent;
+  font-family: 'Segoe UI', 'Helvetica Neue', sans-serif;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* ── App shell ─────────────────────────────────────────────────── */
+#app {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  position: relative;
+}
+
+/* ── Drag handle (top strip) ──────────────────────────────────── */
+#drag-handle {
+  width: 100%;
+  height: 36px;
+  -webkit-app-region: drag;
+  cursor: grab;
+  flex-shrink: 0;
+}
+#drag-handle:active { cursor: grabbing; }
+
+/* ── Character canvas ─────────────────────────────────────────── */
+#character-canvas {
+  display: block;
+  -webkit-app-region: no-drag;
+  cursor: default;
+}
+
+/* ── Message bubble ───────────────────────────────────────────── */
+#message-bubble {
+  position: absolute;
+  bottom: 48px;
+  left: 8px;
+  right: 8px;
+  background: rgba(255, 255, 255, 0.96);
+  border-radius: 14px;
+  padding: 10px 14px;
+  font-size: 13px;
+  color: #2d2d2d;
+  line-height: 1.5;
+  max-height: 130px;
+  overflow-y: auto;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.18);
+  -webkit-app-region: no-drag;
+  animation: slideUp 0.25s ease;
+  word-break: break-word;
+}
+#message-bubble.hidden { display: none; }
+
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ── Status bar ───────────────────────────────────────────────── */
+#status-bar {
+  position: absolute;
+  bottom: 6px;
+  left: 0;
+  right: 0;
+  text-align: center;
+  padding: 0 10px;
+  pointer-events: none;
+}
+
+#status-text {
+  display: inline-block;
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.85);
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.6);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 280px;
+}
+

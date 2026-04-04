@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <title>AI Assistant</title>
+    <!--
+      CSP notes:
+        - 'unsafe-eval' + 'wasm-unsafe-eval': required by @huggingface/transformers (ONNX/WASM runtime)
+        - connect-src *: model download from HuggingFace Hub on first run
+        - worker-src blob: WASM workers spun up by transformers.js
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="
+        default-src 'self';
+        script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval';
+        style-src 'self' 'unsafe-inline';
+        img-src 'self' data: blob:;
+        connect-src 'self' https: blob:;
+        worker-src blob: 'self';
+      "
+    />
+  </head>
+  <body>
+    <div id="app">
+      <div id="drag-handle"></div>
+      <canvas id="character-canvas"></canvas>
+      <div id="message-bubble" class="hidden"></div>
+      <div id="status-bar"><span id="status-text"></span></div>
+    </div>
+    <script type="module" src="/src/renderer.ts"></script>
+  </body>
+</html>
