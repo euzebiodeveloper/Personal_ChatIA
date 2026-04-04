@@ -7,8 +7,6 @@ import { Live2DModel } from 'pixi-live2d-display/cubism4';
 export type CharacterState = 'idle' | 'listening' | 'talking';
 
 const MODEL_PATH = 'live2d/natori_pro_en/runtime/natori_pro_t06.model3.json';
-const MOTION_IDLE = 'Idle';
-const MOTION_TAP  = 'Tap'; // group name from natori_pro_t06.model3.json
 
 export class AnimatedCharacter {
   private app: PIXI.Application;
@@ -66,14 +64,20 @@ export class AnimatedCharacter {
       this.fitModel();
       this.log('info', `Model fitted. Scale: ${model.scale.x.toFixed(3)}, pos: (${model.x.toFixed(0)}, ${model.y.toFixed(0)})`);
 
-      model.interactive = true;
-      model.on('hit', (areas: string[]) => {
-        this.log('info', `Hit areas: ${areas.join(', ')}`);
-        if (areas.includes('Body')) model.motion(MOTION_TAP);
-      });
+      model.interactive = false;
 
-      model.motion(MOTION_IDLE);
-      this.log('info', 'Idle motion started — Live2D ready!');
+      // Stop all motions — only physics-based default pose + lip sync
+      model.internalModel.motionManager.stopAllMotions();
+
+      // Disable automatic expression cycling from ExpressionManager
+      const exprMgr = (model.internalModel.motionManager as Record<string, unknown>).expressionManager as Record<string, unknown> | null | undefined;
+      if (exprMgr) {
+        exprMgr['reserveExpression'] = () => false;
+        exprMgr['startMotion']       = async () => -1;
+        exprMgr['update']            = () => false;
+      }
+
+      this.log('info', 'Model ready (no motion, no expression — physics idle only)');
     } catch (err) {
       const msg = err instanceof Error
         ? `${err.message}\nstack: ${err.stack ?? '(none)'}`
@@ -117,6 +121,9 @@ export class AnimatedCharacter {
     this.stopLipSync();
     this.lipSyncStart = performance.now();
 
+    // Ensure no motion is playing (hand/body animations)
+    this.model?.internalModel.motionManager.stopAllMotions();
+
     const tick = (now: number) => {
       if (!this.model || this.state !== 'talking') return;
 
@@ -156,15 +163,10 @@ export class AnimatedCharacter {
 
     switch (s) {
       case 'idle':
-        this.stopLipSync();
-        this.model.expression('Normal');
-        break;
       case 'listening':
         this.stopLipSync();
-        this.model.expression('Smile');
         break;
       case 'talking':
-        this.model.expression('Smile');
         this.startLipSync();
         break;
     }
