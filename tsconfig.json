@@ -9,9 +9,10 @@
     "noImplicitAny": true,
     "sourceMap": true,
     "outDir": "dist",
-    "moduleResolution": "bundler",
+    "moduleResolution": "node",
     "resolveJsonModule": true,
-    "types": ["node"]
+    "types": ["node"],
+    "ignoreDeprecations": "6.0"
   },
   "include": ["src/**/*", "forge.env.d.ts"],
   "exclude": ["node_modules", "dist", ".vite"]

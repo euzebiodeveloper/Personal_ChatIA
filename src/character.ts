@@ -1,273 +1,138 @@
+import * as PIXI from 'pixi.js';
+import { Live2DModel } from 'pixi-live2d-display/cubism4';
+
+// pixi-live2d-display requires PIXI on the window object
+(window as typeof window & { PIXI: typeof PIXI }).PIXI = PIXI;
+
 export type CharacterState = 'idle' | 'listening' | 'talking';
 
+const MODEL_PATH = 'live2d/natori_pro_en/runtime/natori_pro_t06.model3.json';
+const MOTION_IDLE = 'Idle';
+const MOTION_TAP  = 'Tap'; // group name from natori_pro_t06.model3.json
+
 export class AnimatedCharacter {
-  private canvas: HTMLCanvasElement;
-  private ctx: CanvasRenderingContext2D;
+  private app: PIXI.Application;
+  private model: Live2DModel | null = null;
   private state: CharacterState = 'idle';
-  private time = 0;
-  private mouthOpen = 0;
-  private blinkTimer = 0;
-  private blinkAmount = 0; // 0 = fully open, 1 = fully closed
   private rafId: number | null = null;
 
   constructor(canvas: HTMLCanvasElement) {
-    this.canvas = canvas;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) throw new Error('Canvas 2D not supported');
-    this.ctx = ctx;
-    this.canvas.width = 280;
-    this.canvas.height = 360;
-    this.loop(0);
+    const parent = canvas.parentElement;
+    this.app = new PIXI.Application({
+      view: canvas,
+      width:  parent?.clientWidth  ?? 320,
+      height: parent?.clientHeight ?? 440,
+      backgroundAlpha: 0,
+      antialias: true,
+      autoDensity: true,
+      resolution: window.devicePixelRatio || 1,
+    });
+    this.loadModel();
+  }
+
+  private log(level: 'info' | 'warn' | 'error', msg: string): void {
+    // window.electronAPI may not exist yet if called before DOMContentLoaded
+    try {
+      window.electronAPI?.writeLog(level, `[character] ${msg}`);
+    } catch { /* ignore */ }
+    console[level](`[character] ${msg}`);
+  }
+
+  private async loadModel(): Promise<void> {
+    this.log('info', `Starting Live2D load. MODEL_PATH="${MODEL_PATH}"`);
+    this.log('info', `PIXI version: ${PIXI.VERSION}`);
+    this.log('info', `Canvas size: ${this.app.screen.width}x${this.app.screen.height}`);
+
+    // Check if Live2DModel is available
+    this.log('info', `Live2DModel type: ${typeof Live2DModel}`);
+
+    try {
+      this.log('info', 'Calling Live2DModel.from()...');
+      const model = await Live2DModel.from(MODEL_PATH, {
+        onError: (err: Error) => {
+          this.log('error', `Live2DModel internal error: ${err?.message ?? String(err)}`);
+        },
+      } as Parameters<typeof Live2DModel.from>[1]);
+
+      this.log('info', `Model loaded. Size: ${model.width}x${model.height}`);
+      this.model = model;
+      this.app.stage.addChild(model as unknown as PIXI.DisplayObject);
+      this.log('info', 'Model added to stage');
+
+      this.fitModel();
+      this.log('info', `Model fitted. Scale: ${model.scale.x.toFixed(3)}, pos: (${model.x.toFixed(0)}, ${model.y.toFixed(0)})`);
+
+      model.interactive = true;
+      model.on('hit', (areas: string[]) => {
+        this.log('info', `Hit areas: ${areas.join(', ')}`);
+        if (areas.includes('Body')) model.motion(MOTION_TAP);
+      });
+
+      model.motion(MOTION_IDLE);
+      this.log('info', 'Idle motion started — Live2D ready!');
+    } catch (err) {
+      const msg = err instanceof Error
+        ? `${err.message}\nstack: ${err.stack ?? '(none)'}`
+        : String(err);
+      this.log('error', `Live2D load FAILED: ${msg}`);
+      this.log('warn', 'Showing fallback circle instead');
+      this.renderFallback();
+    }
+  }
+
+  private fitModel(): void {
+    if (!this.model) return;
+    const { width: cw, height: ch } = this.app.screen;
+    const { width: mw, height: mh } = this.model;
+
+    // ZOOM > 1 = zoom in. At 2.4x the canvas only shows ~40% of the model height (chest-up).
+    // Increase to zoom more in; decrease toward 0.9 to show more of the body.
+    const ZOOM = 2.4;
+    const scale = Math.min(cw / mw, ch / mh) * ZOOM;
+    this.model.scale.set(scale);
+
+    // Center horizontally (sides may overflow — that's fine)
+    this.model.x = (cw - mw * scale) / 2;
+
+    // Anchor near the top of the canvas so the upper body (chest up) is visible.
+    // Increase TOP_PAD to add more space above the head; decrease to crop higher.
+    const TOP_PAD = ch * 0.05;
+    this.model.y = TOP_PAD;
+  }
+
+  private renderFallback(): void {
+    this.log('warn', 'renderFallback() called — drawing blue circle placeholder');
+    const g = new PIXI.Graphics();
+    g.beginFill(0x4a6fa5);
+    g.drawCircle(this.app.screen.width / 2, this.app.screen.height / 2, 60);
+    g.endFill();
+    this.app.stage.addChild(g);
   }
 
   setState(s: CharacterState): void {
+    if (this.state === s) return;
     this.state = s;
-  }
 
-  private loop = (ts: number) => {
-    this.time = ts / 1000;
-    this.updateLogic();
-    this.render();
-    this.rafId = requestAnimationFrame(this.loop);
-  };
+    if (!this.model) return;
 
-  private updateLogic(): void {
-    // Blink: every ~3–5s, rapidly close and open
-    this.blinkTimer++;
-    if (this.blinkTimer > 180 + Math.floor(Math.random() * 120)) {
-      this.blinkTimer = 0;
-    }
-    const blinkPhase = this.blinkTimer;
-    if (blinkPhase < 4) {
-      this.blinkAmount = blinkPhase / 4;
-    } else if (blinkPhase < 8) {
-      this.blinkAmount = 1 - (blinkPhase - 4) / 4;
-    } else {
-      this.blinkAmount = 0;
-    }
-
-    // Mouth moves during talking
-    if (this.state === 'talking') {
-      this.mouthOpen = 0.3 + 0.7 * Math.abs(Math.sin(this.time * 7));
-    } else {
-      this.mouthOpen = Math.max(0, this.mouthOpen - 0.06);
-    }
-  }
-
-  private render(): void {
-    const { ctx, canvas, state, time } = this;
-    const w = canvas.width;
-    const h = canvas.height;
-    ctx.clearRect(0, 0, w, h);
-
-    const cx = w / 2;
-    const baseY = h / 2 - 10;
-
-    // Float / bounce
-    const floatY = state === 'idle' ? Math.sin(time * 1.4) * 5 : 0;
-    const pulse = state === 'listening' ? 1 + Math.sin(time * 5) * 0.03 : 1;
-
-    ctx.save();
-    ctx.translate(cx, baseY + floatY);
-    ctx.scale(pulse, pulse);
-
-    // Listening glow
-    if (state === 'listening') {
-      const g = ctx.createRadialGradient(0, 0, 55, 0, 0, 105);
-      g.addColorStop(0, 'rgba(80, 180, 255, 0.25)');
-      g.addColorStop(1, 'rgba(80, 180, 255, 0)');
-      ctx.fillStyle = g;
-      ctx.beginPath();
-      ctx.arc(0, 0, 105, 0, Math.PI * 2);
-      ctx.fill();
-    }
-
-    // Talking glow
-    if (state === 'talking') {
-      const g = ctx.createRadialGradient(0, 0, 55, 0, 0, 105);
-      g.addColorStop(0, 'rgba(255, 180, 80, 0.2)');
-      g.addColorStop(1, 'rgba(255, 180, 80, 0)');
-      ctx.fillStyle = g;
-      ctx.beginPath();
-      ctx.arc(0, 0, 105, 0, Math.PI * 2);
-      ctx.fill();
-    }
-
-    // Drop shadow
-    ctx.shadowColor = 'rgba(0,0,0,0.25)';
-    ctx.shadowBlur = 18;
-    ctx.shadowOffsetY = 8;
-
-    // --- HAIR (behind face) ---
-    ctx.fillStyle = '#4A2C2A';
-    // Top hair
-    ctx.beginPath();
-    ctx.ellipse(0, -58, 80, 42, 0, Math.PI, 0);
-    ctx.fill();
-    // Side hair left
-    ctx.beginPath();
-    ctx.ellipse(-70, -12, 20, 50, -0.25, 0, Math.PI * 2);
-    ctx.fill();
-    // Side hair right
-    ctx.beginPath();
-    ctx.ellipse(70, -12, 20, 50, 0.25, 0, Math.PI * 2);
-    ctx.fill();
-
-    ctx.shadowColor = 'transparent';
-    ctx.shadowBlur = 0;
-    ctx.shadowOffsetY = 0;
-
-    // --- FACE ---
-    const faceGrad = ctx.createRadialGradient(-12, -18, 0, 0, 0, 78);
-    faceGrad.addColorStop(0, '#FFE8CE');
-    faceGrad.addColorStop(1, '#FFBF96');
-    ctx.fillStyle = faceGrad;
-    ctx.beginPath();
-    ctx.ellipse(0, 0, 74, 80, 0, 0, Math.PI * 2);
-    ctx.fill();
-
-    // --- HAIR FRINGE (front) ---
-    ctx.fillStyle = '#4A2C2A';
-    ctx.beginPath();
-    ctx.moveTo(-80, -35);
-    ctx.bezierCurveTo(-60, -95, 60, -95, 80, -35);
-    ctx.bezierCurveTo(55, -55, -55, -55, -80, -35);
-    ctx.fill();
-    // Fringe strands
-    ctx.beginPath();
-    ctx.moveTo(-20, -78);
-    ctx.quadraticCurveTo(-15, -40, -8, -25);
-    ctx.lineWidth = 14;
-    ctx.strokeStyle = '#4A2C2A';
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.moveTo(20, -78);
-    ctx.quadraticCurveTo(15, -40, 8, -25);
-    ctx.stroke();
-    ctx.lineWidth = 1;
-
-    // --- EYES ---
-    const eyeY = -8;
-    const eyeHalfH = 14 * (1 - this.blinkAmount);
-
-    // Eye whites
-    ctx.fillStyle = 'white';
-    ctx.beginPath();
-    ctx.ellipse(-26, eyeY, 15, Math.max(0.5, eyeHalfH), 0, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.beginPath();
-    ctx.ellipse(26, eyeY, 15, Math.max(0.5, eyeHalfH), 0, 0, Math.PI * 2);
-    ctx.fill();
-
-    if (eyeHalfH > 3) {
-      // Iris
-      ctx.fillStyle = '#4A6FA5';
-      ctx.beginPath();
-      ctx.ellipse(-26, eyeY + 2, 9, Math.min(9, eyeHalfH - 2), 0, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.beginPath();
-      ctx.ellipse(26, eyeY + 2, 9, Math.min(9, eyeHalfH - 2), 0, 0, Math.PI * 2);
-      ctx.fill();
-
-      // Pupils
-      ctx.fillStyle = '#1A1A2E';
-      ctx.beginPath();
-      ctx.ellipse(-26, eyeY + 3, 5, Math.min(6, eyeHalfH - 4), 0, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.beginPath();
-      ctx.ellipse(26, eyeY + 3, 5, Math.min(6, eyeHalfH - 4), 0, 0, Math.PI * 2);
-      ctx.fill();
-
-      // Shine
-      ctx.fillStyle = 'rgba(255,255,255,0.9)';
-      ctx.beginPath();
-      ctx.arc(-22, eyeY - 2, 3, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.beginPath();
-      ctx.arc(30, eyeY - 2, 3, 0, Math.PI * 2);
-      ctx.fill();
-    }
-
-    // Eyelashes (top)
-    ctx.strokeStyle = '#1A1A2E';
-    ctx.lineWidth = 1.8;
-    ctx.beginPath();
-    ctx.ellipse(-26, eyeY - (eyeHalfH * 0.4), 15, eyeHalfH * 0.2, 0, Math.PI, 0);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.ellipse(26, eyeY - (eyeHalfH * 0.4), 15, eyeHalfH * 0.2, 0, Math.PI, 0);
-    ctx.stroke();
-    ctx.lineWidth = 1;
-
-    // --- BLUSH ---
-    ctx.fillStyle = 'rgba(255, 102, 102, 0.25)';
-    ctx.beginPath();
-    ctx.ellipse(-46, 18, 16, 9, 0, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.beginPath();
-    ctx.ellipse(46, 18, 16, 9, 0, 0, Math.PI * 2);
-    ctx.fill();
-
-    // --- NOSE ---
-    ctx.strokeStyle = 'rgba(200, 120, 80, 0.45)';
-    ctx.lineWidth = 1.5;
-    ctx.lineCap = 'round';
-    ctx.beginPath();
-    ctx.moveTo(-4, 16);
-    ctx.quadraticCurveTo(0, 24, 4, 16);
-    ctx.stroke();
-    ctx.lineWidth = 1;
-
-    // --- MOUTH ---
-    const mouthY = 36;
-    if (this.mouthOpen > 0.06) {
-      // Open mouth (talking)
-      const ow = 20 * this.mouthOpen;
-      const oh = 14 * this.mouthOpen;
-      ctx.fillStyle = '#A83232';
-      ctx.beginPath();
-      ctx.ellipse(0, mouthY + oh * 0.3, ow, oh, 0, 0, Math.PI * 2);
-      ctx.fill();
-      // Teeth
-      ctx.fillStyle = 'white';
-      ctx.beginPath();
-      ctx.ellipse(0, mouthY, ow * 0.9, oh * 0.45, 0, 0, Math.PI);
-      ctx.fill();
-    } else {
-      // Smile
-      ctx.strokeStyle = '#C44444';
-      ctx.lineWidth = 2.2;
-      ctx.lineCap = 'round';
-      ctx.beginPath();
-      ctx.moveTo(-16, mouthY);
-      ctx.quadraticCurveTo(0, mouthY + 12, 16, mouthY);
-      ctx.stroke();
-      ctx.lineWidth = 1;
-    }
-
-    ctx.restore();
-
-    // --- Status text at bottom ---
-    const label =
-      state === 'listening' ? '🎤 Ouvindo...' :
-      state === 'talking'   ? '💬 Falando...' : '';
-
-    if (label) {
-      const bx = w / 2;
-      const by = h - 22;
-      ctx.fillStyle = 'rgba(0,0,0,0.55)';
-      ctx.beginPath();
-      (ctx as CanvasRenderingContext2D & { roundRect?: (...a: unknown[]) => void }).roundRect?.(bx - 62, by - 16, 124, 26, 13);
-      ctx.fill();
-      ctx.fillStyle = 'white';
-      ctx.font = '12px "Segoe UI", sans-serif';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(label, bx, by - 3);
+    switch (s) {
+      case 'idle':
+        // Reset to neutral — no special expression
+        this.model.expression('Normal');
+        break;
+      case 'listening':
+        // Show attentive expression while recording
+        this.model.expression('Smile');
+        break;
+      case 'talking':
+        // Show happy/engaged expression while responding
+        this.model.expression('Smile');
+        break;
     }
   }
 
   destroy(): void {
     if (this.rafId !== null) cancelAnimationFrame(this.rafId);
+    this.app?.destroy(false, { children: true });
   }
 }
