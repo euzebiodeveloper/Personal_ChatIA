@@ -27,6 +27,12 @@ const api: ElectronAPI = {
     ipcRenderer.on('model-loading', (_e, status: string) => cb(status));
   },
 
+  writeLog: (level: 'info' | 'warn' | 'error', msg: string) => {
+    ipcRenderer.send('write-log', level, msg);
+  },
+
+  getLogPath: () => ipcRenderer.invoke('get-log-path') as Promise<string>,
+
   removeAllListeners: (channel: string) => {
     ipcRenderer.removeAllListeners(channel);
   },

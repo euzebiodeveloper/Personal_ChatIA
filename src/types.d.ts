@@ -12,6 +12,8 @@ export interface ElectronAPI {
   sendTranscription: (text: string) => Promise<AIResponse>;
   onReady: () => void;
   getModelsPath: () => Promise<string>;
+  writeLog: (level: 'info' | 'warn' | 'error', msg: string) => void;
+  getLogPath: () => Promise<string>;
 
   // Main → Renderer (push events)
   onCharacterState: (callback: (state: CharacterState) => void) => void;

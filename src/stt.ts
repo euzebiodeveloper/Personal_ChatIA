@@ -19,9 +19,9 @@ async function ensurePipeline(onStatus?: LoadCallback): Promise<void> {
 
     pipeline = await buildPipeline(
       'automatic-speech-recognition',
-      'Xenova/whisper-base',  // ~74MB — supports Portuguese
+      'Xenova/whisper-tiny',  // ~75MB multilingual — compatível com fp32
       {
-        dtype: 'q8',
+        dtype: 'fp32',
         progress_callback: (prog: { status: string; progress?: number }) => {
           if (prog.status === 'downloading' && prog.progress !== undefined) {
             onStatus?.(`Baixando modelo: ${Math.round(prog.progress)}%`);

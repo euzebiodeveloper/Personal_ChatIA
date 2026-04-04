@@ -4,6 +4,7 @@ import started from 'electron-squirrel-startup';
 import dotenv from 'dotenv';
 import { setupTray } from './tray';
 import { processTranscription } from './ai';
+import { logger } from './logger';
 
 // Load API keys from project root .env (development) and userData/.env (production)
 dotenv.config();
@@ -86,4 +87,11 @@ ipcMain.handle('get-models-path', () =>
 
 ipcMain.on('renderer-ready', () => {
   mainWindow?.webContents.send('character-state', 'idle');
+  logger.info('Renderer ready. Log file: ' + logger.path());
 });
+
+ipcMain.on('write-log', (_e, level: 'info' | 'warn' | 'error', msg: string) => {
+  logger[level](msg);
+});
+
+ipcMain.handle('get-log-path', () => logger.path());

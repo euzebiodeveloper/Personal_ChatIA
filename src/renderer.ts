@@ -65,34 +65,73 @@ async function handleToggle(): Promise<void> {
     character.setState('idle');
     showStatus('⏳ Transcrevendo...');
 
+    // ── Step 1: stop recording ───────────────────────────────────────────
+    let blob: Blob;
     try {
-      const blob = await recorder.stop();
-
-      if (blob.size < 1000) {
-        showStatus('Áudio muito curto, tente novamente.');
-        isProcessing = false;
-        setTimeout(() => showStatus(''), 3000);
-        return;
-      }
-
-      const text = await transcribe(blob, (status) => showStatus(status));
-
-      if (!text) {
-        showStatus('Não entendi. Tente novamente.');
-        isProcessing = false;
-        setTimeout(() => showStatus(''), 3000);
-        return;
-      }
-
-      showStatus(`Você: "${text}"`);
-      showBubble(`Você: ${text}`, 4000);
-
-      await window.electronAPI.sendTranscription(text);
+      blob = await recorder.stop();
+      const info = `blob size=${blob.size} type=${blob.type}`;
+      window.electronAPI.writeLog('info', `[step1] ${info}`);
+      showStatus(`[1/3] Áudio capturado (${blob.size} bytes)`);
     } catch (err) {
-      console.error('[renderer] processing error:', err);
-      showStatus('Erro ao processar. Tente novamente.');
+      const msg = err instanceof Error ? err.message : String(err);
+      window.electronAPI.writeLog('error', `[step1] recorder.stop() failed: ${msg}`);
+      showBubble(`❌ Erro na gravação: ${msg}`, 10000);
       character.setState('idle');
-      setTimeout(() => showStatus(''), 4000);
+      isProcessing = false;
+      return;
+    }
+
+    if (blob.size < 1000) {
+      window.electronAPI.writeLog('warn', `[step1] blob too small: ${blob.size} bytes`);
+      showStatus('Áudio muito curto, tente novamente.');
+      isProcessing = false;
+      setTimeout(() => showStatus(''), 3000);
+      return;
+    }
+
+    // ── Step 2: transcribe ───────────────────────────────────────────────
+    let text: string;
+    try {
+      showStatus('[2/3] Transcrevendo com Whisper...');
+      window.electronAPI.writeLog('info', '[step2] starting transcription');
+      text = await transcribe(blob, (status) => {
+        showStatus(`[2/3] ${status}`);
+        window.electronAPI.writeLog('info', `[step2] ${status}`);
+      });
+      window.electronAPI.writeLog('info', `[step2] result: "${text}"`);
+    } catch (err) {
+      const msg = err instanceof Error ? `${err.message}\nstack: ${(err as Error).stack}` : String(err);
+      window.electronAPI.writeLog('error', `[step2] transcribe() failed: ${msg}`);
+      showBubble(`❌ Erro no Whisper: ${err instanceof Error ? err.message : String(err)}`, 10000);
+      showStatus('Erro na transcrição. Veja assistant.log');
+      character.setState('idle');
+      isProcessing = false;
+      return;
+    }
+
+    if (!text) {
+      window.electronAPI.writeLog('warn', '[step2] empty transcription');
+      showStatus('Não entendi. Tente novamente.');
+      isProcessing = false;
+      setTimeout(() => showStatus(''), 3000);
+      return;
+    }
+
+    showStatus(`Você: "${text}"`);
+    showBubble(`Você: ${text}`, 4000);
+
+    // ── Step 3: send to AI ───────────────────────────────────────────────
+    try {
+      showStatus('[3/3] Aguardando resposta da IA...');
+      window.electronAPI.writeLog('info', `[step3] sending to AI: "${text}"`);
+      await window.electronAPI.sendTranscription(text);
+      window.electronAPI.writeLog('info', '[step3] AI response received');
+    } catch (err) {
+      const msg = err instanceof Error ? `${err.message}\nstack: ${(err as Error).stack}` : String(err);
+      window.electronAPI.writeLog('error', `[step3] sendTranscription() failed: ${msg}`);
+      showBubble(`❌ Erro na IA: ${err instanceof Error ? err.message : String(err)}`, 10000);
+      showStatus('Erro ao contactar a IA. Veja assistant.log');
+      character.setState('idle');
     } finally {
       isProcessing = false;
     }
