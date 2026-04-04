@@ -16,6 +16,10 @@ export class AnimatedCharacter {
   private state: CharacterState = 'idle';
   private rafId: number | null = null;
 
+  // Lip sync: sinusoidal animation of ParamMouthOpenY while talking
+  private lipSyncRaf: number | null = null;
+  private lipSyncStart = 0;
+
   constructor(canvas: HTMLCanvasElement) {
     const parent = canvas.parentElement;
     this.app = new PIXI.Application({
@@ -109,6 +113,41 @@ export class AnimatedCharacter {
     this.app.stage.addChild(g);
   }
 
+  private startLipSync(): void {
+    this.stopLipSync();
+    this.lipSyncStart = performance.now();
+
+    const tick = (now: number) => {
+      if (!this.model || this.state !== 'talking') return;
+
+      const elapsed = now - this.lipSyncStart;
+      // Primary wave (speech rhythm ~3 Hz) + secondary harmonic for naturalness
+      const value = Math.max(0,
+        0.6 * Math.sin(elapsed * 0.019) +
+        0.3 * Math.sin(elapsed * 0.037)
+      );
+
+      try {
+        this.model.internalModel.coreModel.setParameterValueById('ParamMouthOpenY', value);
+      } catch { /* parameter may not be writable mid-frame */ }
+
+      this.lipSyncRaf = requestAnimationFrame(tick);
+    };
+
+    this.lipSyncRaf = requestAnimationFrame(tick);
+  }
+
+  private stopLipSync(): void {
+    if (this.lipSyncRaf !== null) {
+      cancelAnimationFrame(this.lipSyncRaf);
+      this.lipSyncRaf = null;
+    }
+    // Close the mouth when stopping
+    try {
+      this.model?.internalModel.coreModel.setParameterValueById('ParamMouthOpenY', 0);
+    } catch { /* ignore */ }
+  }
+
   setState(s: CharacterState): void {
     if (this.state === s) return;
     this.state = s;
@@ -117,21 +156,22 @@ export class AnimatedCharacter {
 
     switch (s) {
       case 'idle':
-        // Reset to neutral — no special expression
+        this.stopLipSync();
         this.model.expression('Normal');
         break;
       case 'listening':
-        // Show attentive expression while recording
+        this.stopLipSync();
         this.model.expression('Smile');
         break;
       case 'talking':
-        // Show happy/engaged expression while responding
         this.model.expression('Smile');
+        this.startLipSync();
         break;
     }
   }
 
   destroy(): void {
+    this.stopLipSync();
     if (this.rafId !== null) cancelAnimationFrame(this.rafId);
     this.app?.destroy(false, { children: true });
   }
