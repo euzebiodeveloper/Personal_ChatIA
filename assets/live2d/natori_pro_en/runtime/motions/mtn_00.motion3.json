@@ -380,21 +380,6 @@
 		},
 		{
 			"Target": "Parameter",
-			"Id": "ParamMouthOpenY",
-			"Segments": [
-				0,
-				0,
-				1,
-				2.656,
-				0,
-				5.311,
-				0,
-				7.967,
-				0
-			]
-		},
-		{
-			"Target": "Parameter",
 			"Id": "ParamMouthForm2",
 			"Segments": [
 				0,

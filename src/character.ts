@@ -66,9 +66,6 @@ export class AnimatedCharacter {
 
       model.interactive = false;
 
-      // Stop all motions — only physics-based default pose + lip sync
-      model.internalModel.motionManager.stopAllMotions();
-
       // Disable automatic expression cycling from ExpressionManager
       const exprMgr = (model.internalModel.motionManager as Record<string, unknown>).expressionManager as Record<string, unknown> | null | undefined;
       if (exprMgr) {
@@ -77,7 +74,7 @@ export class AnimatedCharacter {
         exprMgr['update']            = () => false;
       }
 
-      this.log('info', 'Model ready (no motion, no expression — physics idle only)');
+      this.log('info', 'Model ready (idle mtn_00: breath + eyes + mouth; lip sync overrides mouth while talking)');
     } catch (err) {
       const msg = err instanceof Error
         ? `${err.message}\nstack: ${err.stack ?? '(none)'}`
@@ -121,18 +118,17 @@ export class AnimatedCharacter {
     this.stopLipSync();
     this.lipSyncStart = performance.now();
 
-    // Ensure no motion is playing (hand/body animations)
-    this.model?.internalModel.motionManager.stopAllMotions();
-
     const tick = (now: number) => {
       if (!this.model || this.state !== 'talking') return;
 
       const elapsed = now - this.lipSyncStart;
-      // Primary wave (speech rhythm ~3 Hz) + secondary harmonic for naturalness
-      const value = Math.max(0,
+      // +0.25 offset keeps mouth partially open throughout speech so it never
+      // stays closed for long stretches; clamped to [0, 1].
+      const value = Math.min(1, Math.max(0,
         0.6 * Math.sin(elapsed * 0.019) +
-        0.3 * Math.sin(elapsed * 0.037)
-      );
+        0.3 * Math.sin(elapsed * 0.037) +
+        0.25
+      ));
 
       try {
         this.model.internalModel.coreModel.setParameterValueById('ParamMouthOpenY', value);

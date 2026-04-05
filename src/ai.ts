@@ -47,8 +47,9 @@ export async function transcribeAudio(buffer: Buffer): Promise<string> {
   const file = new File([new Uint8Array(buffer)], 'audio.webm', { type: 'audio/webm' });
   const result = await getClient().audio.transcriptions.create({
     file,
-    model: 'whisper-large-v3-turbo',
-    // No language forced — auto-detects pt-BR and en
+    model: 'whisper-large-v3',
+    language: 'pt',
+    prompt: 'Assistente de IA pessoal em português brasileiro. Comandos de voz para computador.',
   });
   return result.text.trim();
 }

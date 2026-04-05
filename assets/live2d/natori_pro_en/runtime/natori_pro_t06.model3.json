@@ -58,12 +58,6 @@
 			"Idle": [
 				{
 					"File": "motions/mtn_00.motion3.json"
-				},
-				{
-					"File": "motions/mtn_01.motion3.json"
-				},
-				{
-					"File": "motions/mtn_02.motion3.json"
 				}
 			],
 			"Tap": [
