@@ -3,7 +3,7 @@ import path from 'node:path';
 import started from 'electron-squirrel-startup';
 import dotenv from 'dotenv';
 import { setupTray } from './tray';
-import { processTranscription, transcribeAudio } from './ai';
+import { processLayeredMessage, transcribeAudio } from './ai';
 import { logger } from './logger';
 
 // Load API keys from project root .env (development) and userData/.env (production)
@@ -78,7 +78,7 @@ app.on('will-quit', () => {
 
 ipcMain.handle('process-transcription', async (_e, text: string) => {
   if (!mainWindow) return { text: 'Janela não encontrada.' };
-  return processTranscription(text, mainWindow);
+  return processLayeredMessage(text, mainWindow);
 });
 
 ipcMain.handle('get-models-path', () =>

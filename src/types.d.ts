@@ -7,6 +7,14 @@ export interface AIResponse {
   action?: string;
 }
 
+export interface AutomationStep {
+  x_pct: number;
+  y_pct: number;
+  need_exclude: boolean;
+  need_text: boolean;
+  insert_text?: string;
+}
+
 export interface ElectronAPI {
   // Renderer → Main
   sendTranscription: (text: string) => Promise<AIResponse>;

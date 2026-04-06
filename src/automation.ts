@@ -1,6 +1,10 @@
 import { shell } from 'electron';
 import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
+import { readFile, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type { AutomationStep } from './types';
 
 const execAsync = promisify(exec);
 
@@ -93,5 +97,113 @@ async function pressKey(key: string): Promise<void> {
   // Linux: xdotool (best-effort)
   else {
     await execAsync(`xdotool key ${key}`).catch(() => {});
+  }
+}
+
+// ── Screen capture ───────────────────────────────────────────────────────────
+
+export interface ScreenCapture {
+  base64: string;
+  width: number;
+  height: number;
+}
+
+export async function captureScreen(): Promise<ScreenCapture> {
+  const tmpPath = join(tmpdir(), `ai-assistant-screen-${Date.now()}.png`);
+  const metaPath = tmpPath + '.meta.json';
+
+  const script = `
+Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Windows.Forms
+$screen = [System.Windows.Forms.Screen]::PrimaryScreen
+$bounds = $screen.Bounds
+$bmp = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
+$g = [System.Drawing.Graphics]::FromImage($bmp)
+$g.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+$g.Dispose()
+$bmp.Save($env:SCREENSHOT_PATH)
+$meta = '{"width":' + $bmp.Width + ',"height":' + $bmp.Height + '}'
+[System.IO.File]::WriteAllText($env:META_PATH, $meta)
+$bmp.Dispose()
+`;
+  await runPs(script, { SCREENSHOT_PATH: tmpPath, META_PATH: metaPath });
+
+  const [data, metaRaw] = await Promise.all([readFile(tmpPath), readFile(metaPath, 'utf8')]);
+  await Promise.all([rm(metaPath).catch(() => {})]);
+
+  const meta = JSON.parse(metaRaw) as { width: number; height: number };
+  console.log(`[captureScreen] screenshot saved at: ${tmpPath} (${meta.width}x${meta.height})`);
+
+  return { base64: data.toString('base64'), width: meta.width, height: meta.height };
+}
+
+// ── PowerShell helper: no quoting issues via -EncodedCommand ─────────────────
+
+async function runPs(script: string, env?: Record<string, string>): Promise<void> {
+  const encoded = Buffer.from(script, 'utf16le').toString('base64');
+  const opts = env ? { env: { ...process.env, ...env } } : undefined;
+  await execAsync(`powershell -NoProfile -EncodedCommand ${encoded}`, opts);
+}
+
+// ── Mouse control ────────────────────────────────────────────────────────────
+
+export async function clickAt(x: number, y: number): Promise<void> {
+  await runPs(`
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class MouseOps {
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
+    [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, int dx, int dy, uint dwData, int dwExtraInfo);
+    public const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
+    public const uint MOUSEEVENTF_LEFTUP   = 0x0004;
+}
+"@
+[MouseOps]::SetCursorPos(${x}, ${y})
+Start-Sleep -Milliseconds 80
+[MouseOps]::mouse_event([MouseOps]::MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+Start-Sleep -Milliseconds 80
+[MouseOps]::mouse_event([MouseOps]::MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+`);
+}
+
+// ── Keyboard helpers ─────────────────────────────────────────────────────────
+
+export async function clearField(): Promise<void> {
+  await runPs(`
+Add-Type -AssemblyName System.Windows.Forms
+Start-Sleep -Milliseconds 150
+[System.Windows.Forms.SendKeys]::SendWait("^a{DELETE}")
+`);
+}
+
+export async function typeText(text: string): Promise<void> {
+  // Use clipboard + Ctrl+V: reliable in browsers, works with any character
+  await runPs(`
+Add-Type -AssemblyName System.Windows.Forms
+[System.Windows.Forms.Clipboard]::SetText($env:SEND_TEXT)
+Start-Sleep -Milliseconds 150
+[System.Windows.Forms.SendKeys]::SendWait("^v")
+`, { SEND_TEXT: text });
+}
+
+// ── Step executor ────────────────────────────────────────────────────────────
+
+export async function executeSteps(steps: AutomationStep[], screenWidth: number, screenHeight: number): Promise<void> {
+  for (const step of steps) {
+    const x = Math.round(step.x_pct * screenWidth);
+    const y = Math.round(step.y_pct * screenHeight);
+    console.log(`[automation] passo: x_pct=${step.x_pct} y_pct=${step.y_pct} → x=${x} y=${y} exclude=${step.need_exclude} text=${step.need_text} insert="${step.insert_text ?? ''}"`);
+
+    await clickAt(x, y);
+    await new Promise((r) => setTimeout(r, 500));
+
+    if (step.need_exclude) {
+      await clearField();
+    }
+
+    if (step.need_text && step.insert_text) {
+      await typeText(step.insert_text);
+    }
   }
 }
