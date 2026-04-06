@@ -422,6 +422,11 @@ Dicas de interface universais:
 - SELECT/DROPDOWN (caixas com seta ▼ ao lado): são elementos de seleção, NÃO campos de texto. Se identificar um select/dropdown, defina element_type="select", need_exclude=false, need_text=false, requery=true — apenas clique para abrir o dropdown. Na próxima análise (após requery), a tela mostrará as opções abertas e você deverá clicar na opção desejada.
 - INPUT de texto (campo sem seta, com cursor): use need_exclude=true se precisar limpar antes, need_text=true para digitar, element_type="input".
 
+REGRA CRÍTICA sobre requery:
+- requery=true SOMENTE quando o clique **abre um menu/dropdown** cujas opções precisam ser vistas numa próxima análise. EXEMPLOS: abrir um <select>, abrir um menu de contexto.
+- requery=false para TODO o resto: botões de ação (voltar, avançar, enviar, fechar, confirmar, cadastrar), links de navegação, checkboxes, radio buttons, botão de busca, botão de voltar do browser, qualquer botão que apenas executa uma ação direta.
+- NUNCA use requery=true em botões de navegação do browser (← voltar, → avançar, ↺ reload) — esses são ações terminais, executam e pronto.
+
 Responda APENAS com um array JSON:
 [
   {
@@ -433,7 +438,7 @@ Responda APENAS com um array JSON:
     "need_text": <true APENAS para inputs de texto onde é preciso digitar algo — NUNCA use em selects ou botões>,
     "insert_text": "<texto a digitar, somente se need_text for true>",
     "press_enter": <true se deve pressionar Enter após digitar>,
-    "requery": <true se após este clique a tela vai mudar e será necessária uma nova análise visual — obrigatório para selects/dropdowns>
+    "requery": <true SOMENTE para selects/dropdowns que precisam ser abertos para ver as opções — false para qualquer botão de ação>
   }
 ]
 Não adicione nenhum texto além do array JSON.`

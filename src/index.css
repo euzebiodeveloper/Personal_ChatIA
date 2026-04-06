@@ -76,8 +76,10 @@ html, body {
   pointer-events: none;
   transition: background-color 0.2s ease;
 }
-#mic-dot.dot-green { background: #3ddc84; box-shadow: 0 0 8px rgba(61,220,132,0.7); }
-#mic-dot.dot-red   { background: #e05252; box-shadow: 0 0 8px rgba(224,82,82,0.5); }
+#mic-dot.dot-green  { background: #3ddc84; box-shadow: 0 0 8px rgba(61,220,132,0.7); }
+#mic-dot.dot-red    { background: #e05252; box-shadow: 0 0 8px rgba(224,82,82,0.5); }
+#mic-dot.dot-blue   { background: #4a9eff; box-shadow: 0 0 8px rgba(74,158,255,0.8); }
+#mic-dot.dot-yellow { background: #f5c842; box-shadow: 0 0 8px rgba(245,200,66,0.8); }
 
 /* ── Status bar ───────────────────────────────────────────────── */
 #status-bar {

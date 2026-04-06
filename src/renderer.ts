@@ -61,6 +61,7 @@ async function handleToggle(): Promise<void> {
 async function handleSpeech(blob: Blob): Promise<void> {
   if (isProcessing) return;
   isProcessing = true;
+  setDot('speaking');
   character.setState('listening');
 
   // Step 1: transcribe via Groq Whisper API
@@ -74,6 +75,7 @@ async function handleSpeech(blob: Blob): Promise<void> {
     const msg = err instanceof Error ? `${err.message}\nstack: ${(err as Error).stack}` : String(err);
     window.electronAPI.writeLog('error', `[step2] transcribe() failed: ${msg}`);
     character.setState('idle');
+    setDot('on');
     isProcessing = false;
     return;
   }
@@ -86,6 +88,7 @@ async function handleSpeech(blob: Blob): Promise<void> {
   }
 
   // Step 2: send to AI
+  setDot('processing');
   try {
     window.electronAPI.writeLog('info', `[step3] sending to AI: "${text}"`);
     await window.electronAPI.sendTranscription(text);
@@ -96,14 +99,21 @@ async function handleSpeech(blob: Blob): Promise<void> {
     character.setState('idle');
   } finally {
     isProcessing = false;
+    setDot('on');
   }
 }
 
 // ── UI helpers ────────────────────────────────────────────────────────────────
 
-function setDot(state: 'on' | 'off'): void {
+function setDot(state: 'on' | 'off' | 'speaking' | 'processing'): void {
   const dot = document.getElementById('mic-dot') as HTMLDivElement;
-  dot.className = state === 'on' ? 'dot-green' : 'dot-red';
+  const map: Record<typeof state, string> = {
+    on: 'dot-green',
+    off: 'dot-red',
+    speaking: 'dot-blue',
+    processing: 'dot-yellow',
+  };
+  dot.className = map[state];
 }
 
 function showStatus(text: string): void {
