@@ -286,6 +286,27 @@ Start-Sleep -Milliseconds 150
   }
 }
 
+// Types text character by character via SendKeys — required for date inputs
+// where Ctrl+V paste does not work (browser date pickers consume keys individually)
+export async function typeTextCharByChar(text: string): Promise<void> {
+  if (process.platform === 'win32') {
+    // Escape SendKeys special chars: + ^ % ~ { } [ ] ( )
+    const escaped = text.replace(/([+^%~{}[\]()])/g, '{$1}');
+    await runPs(`
+Add-Type -AssemblyName System.Windows.Forms
+$chars = [System.Text.RegularExpressions.Regex]::Matches($env:SEND_TEXT, '.')
+foreach ($c in $chars) {
+  [System.Windows.Forms.SendKeys]::SendWait($c.Value)
+  Start-Sleep -Milliseconds 80
+}
+`, { SEND_TEXT: escaped });
+  } else {
+    for (const char of text) {
+      await execAsync(`xdotool type --clearmodifiers --delay 80 '${char.replace("'", "'\\''")}' `).catch(() => {});
+    }
+  }
+}
+
 // ── Step executor ────────────────────────────────────────────────────────────
 
 export async function executeSteps(steps: AutomationStep[], screenWidth: number, screenHeight: number): Promise<void> {
@@ -302,7 +323,14 @@ export async function executeSteps(steps: AutomationStep[], screenWidth: number,
     }
 
     if (step.need_text && step.insert_text) {
-      await typeText(step.insert_text);
+      // Date fields (e.g. "01/01/1990", "2026-04-06") require char-by-char input
+      // because the browser date picker does not accept clipboard paste
+      const isDateValue = /^\d{1,4}[\/-]\d{1,2}[\/-]\d{2,4}$/.test(step.insert_text.trim());
+      if (isDateValue) {
+        await typeTextCharByChar(step.insert_text);
+      } else {
+        await typeText(step.insert_text);
+      }
     }
 
     if (step.press_enter) {
