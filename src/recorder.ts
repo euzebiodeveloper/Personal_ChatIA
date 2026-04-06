@@ -1,7 +1,7 @@
 // VAD thresholds
-const THRESHOLD_RMS = 0.018; // RMS level to consider as voice
+const THRESHOLD_RMS = 0.030; // RMS level to consider as voice (higher = ignores quieter background)
 const SILENCE_MS    = 1200;  // ms of silence before finalising a speech clip
-const MIN_SPEECH_MS = 400;   // clips shorter than this are discarded
+const MIN_SPEECH_MS = 600;   // clips shorter than this are discarded (filters accidental triggers)
 
 export class VadRecorder {
   private stream: MediaStream | null = null;
@@ -27,7 +27,7 @@ export class VadRecorder {
   async enable(): Promise<void> {
     if (this._enabled) return;
     this.stream = await navigator.mediaDevices.getUserMedia({
-      audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true },
+    audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
     this.audioCtx = new AudioContext({ sampleRate: 16000 });
     const source = this.audioCtx.createMediaStreamSource(this.stream);

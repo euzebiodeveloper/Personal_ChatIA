@@ -40,6 +40,8 @@
   },
   "dependencies": {
     "@huggingface/transformers": "^4.0.1",
+    "@picovoice/porcupine-web": "^4.0.0",
+    "@picovoice/web-voice-processor": "^4.0.9",
     "dotenv": "^17.4.0",
     "electron-squirrel-startup": "^1.0.1",
     "openai": "^6.33.0",

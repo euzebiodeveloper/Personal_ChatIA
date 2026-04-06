@@ -5,6 +5,7 @@ import dotenv from 'dotenv';
 import { setupTray } from './tray';
 import { processLayeredMessage, transcribeAudio } from './ai';
 import { logger } from './logger';
+import { saveSystemInfo } from './automation';
 
 // Load API keys from project root .env (development) and userData/.env (production)
 dotenv.config();
@@ -52,6 +53,7 @@ function createWindow(): void {
 
 app.on('ready', () => {
   createWindow();
+  saveSystemInfo().catch(console.error);
 
   if (!mainWindow) return;
   setupTray(mainWindow);
@@ -99,3 +101,4 @@ ipcMain.handle('transcribe-audio', async (_e, buffer: Buffer) => {
 });
 
 ipcMain.handle('get-log-path', () => logger.path());
+

@@ -10,10 +10,12 @@ export interface AIResponse {
 export interface AutomationStep {
   x_pct: number;
   y_pct: number;
+  element_type?: 'input' | 'select' | 'button' | 'link' | 'other';
   need_exclude: boolean;
   need_text: boolean;
   insert_text?: string;
   press_enter?: boolean;
+  requery?: boolean;
 }
 
 export interface ElectronAPI {

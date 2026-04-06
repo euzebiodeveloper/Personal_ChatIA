@@ -5,8 +5,8 @@ import type { CharacterState } from './types';
 
 let character: AnimatedCharacter;
 const recorder = new VadRecorder();
-let micEnabled   = false;
-let isProcessing = false;
+let micEnabled      = false;
+let isProcessing    = false;
 
 // ── Boot ─────────────────────────────────────────────────────────────────────
 
