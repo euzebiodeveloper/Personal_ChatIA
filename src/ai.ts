@@ -193,6 +193,62 @@ Retorne APENAS o comando limpo começando com "Bruno,". Sem explicações adicio
   return result || raw;
 }
 
+// ── Layer 1a: is this a direct OS action that needs no screen capture? ────────
+
+async function checkIfDirectOSAction(task: string): Promise<boolean> {
+  const client = getClient();
+  const completion = await client.chat.completions.create({
+    model: 'llama-3.1-8b-instant',
+    messages: [
+      {
+        role: 'system',
+        content: `Você classifica tarefas de controle de computador por voz (PT-BR).
+Responda APENAS "sim" se a tarefa pode ser executada DIRETAMENTE pelo sistema operacional SEM precisar capturar ou visualizar a tela. Responda "não" em todos os outros casos.
+
+São ações diretas do SO — responda "sim":
+- Abrir aplicativos instalados (calculadora, Excel, Word, Chrome, Discord, Steam, VS Code, Spotify, WhatsApp, Notepad, Paint, etc.)
+- Abrir sites ou URLs (YouTube, Google, Amazon, GitHub, etc.)
+- Pesquisar algo no Google ou na web
+- Pressionar teclas do teclado (Enter, Escape, Tab, F5, etc.)
+- Minimizar, maximizar ou fechar a janela ativa
+
+Precisam ver a tela antes de agir — responda "não":
+- Clicar em algum botão, link, ícone ou campo visível na tela agora
+- Preencher ou digitar em campos específicos de formulário
+- Selecionar opções visíveis na tela (dropdowns, checkboxes, radio buttons)
+- Descrever, ler ou analisar o que está mostrando na tela agora
+- Alterar um valor ou elemento que está visível na tela
+- Qualquer ação que dependa do estado atual da tela
+
+Exemplos:
+"Abre a calculadora" → sim
+"Abre o Chrome" → sim
+"Abre o YouTube" → sim
+"Pesquisa gatos no Google" → sim
+"Abre o Discord" → sim
+"Abre o Word" → sim
+"Abre o Steam" → sim
+"Abre o Spotify" → sim
+"Abre o VS Code" → sim
+"Clica no botão enviar" → não
+"Seleciona o tamanho P" → não
+"Preenche o campo de nome com João" → não
+"O que está na minha tela?" → não
+"Mude o select de 1 para 2" → não
+"Digita olá no campo de texto" → não
+"O que está aberto no meu computador?" → não`,
+      },
+      { role: 'user', content: task },
+    ],
+    max_tokens: 5,
+    temperature: 0,
+  });
+  const answer = (completion.choices[0]?.message?.content ?? '').toLowerCase().trim();
+  const isDirect = answer.includes('sim');
+  logger.info(`[layer1a] ação direta no SO: "${answer}" → directOS=${isDirect}`);
+  return isDirect;
+}
+
 // ── Layer 1: does the task need screen interaction? ──────────────────────────
 
 async function checkIfTaskNeedsScreen(task: string): Promise<boolean> {
@@ -297,7 +353,7 @@ async function callVisionModel(
         content: [
           {
             type: 'image_url',
-            image_url: { url: `data:image/png;base64,${capture.base64}` },
+            image_url: { url: `data:image/jpeg;base64,${capture.base64}` },
           },
           { type: 'text', text: prompt },
         ],
@@ -471,6 +527,13 @@ export async function processLayeredMessage(
     // Layer 0: clean transcription — strip background audio, normalize Bruno variants
     const task = await normalizeTranscription(text);
     logger.info(`[pipeline] tarefa normalizada: "${task}"`);
+
+    // Layer 1a: direct OS action? (open app, open URL, press key — no screen capture needed)
+    const isDirectOS = await checkIfDirectOSAction(task);
+    if (isDirectOS) {
+      logger.info('[pipeline] caminho direto → ação de SO (sem captura de tela)');
+      return processTranscription(task, win);
+    }
 
     // Layer 1: does this task need screen interaction?
     const needsScreen = await checkIfTaskNeedsScreen(task);

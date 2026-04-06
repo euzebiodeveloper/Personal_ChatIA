@@ -1,4 +1,4 @@
-import { shell, app, screen } from 'electron';
+import { desktopCapturer, shell, app, screen } from 'electron';
 import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
 import { readFile, writeFile, rm } from 'node:fs/promises';
@@ -166,61 +166,34 @@ export interface ScreenCapture {
 }
 
 export async function captureScreen(): Promise<ScreenCapture> {
-  const tmpPath = join(tmpdir(), `ai-assistant-screen-${Date.now()}.png`);
-
-  if (process.platform === 'win32') {
-    const metaPath = tmpPath + '.meta.json';
-    const script = `
-Add-Type -AssemblyName System.Drawing
-Add-Type -AssemblyName System.Windows.Forms
-$screen = [System.Windows.Forms.Screen]::PrimaryScreen
-$bounds = $screen.Bounds
-$bmp = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
-$g = [System.Drawing.Graphics]::FromImage($bmp)
-$g.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
-$g.Dispose()
-$scaleW = 1280
-$scaleH = [int]($bounds.Height * 1280.0 / $bounds.Width)
-$resized = New-Object System.Drawing.Bitmap($scaleW, $scaleH)
-$gR = [System.Drawing.Graphics]::FromImage($resized)
-$gR.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-$gR.DrawImage($bmp, 0, 0, $scaleW, $scaleH)
-$gR.Dispose()
-$bmp.Dispose()
-$resized.Save($env:SCREENSHOT_PATH)
-$meta = '{"width":' + $bounds.Width + ',"height":' + $bounds.Height + '}'
-[System.IO.File]::WriteAllText($env:META_PATH, $meta)
-$resized.Dispose()
-`;
-    await runPs(script, { SCREENSHOT_PATH: tmpPath, META_PATH: metaPath });
-    const [data, metaRaw] = await Promise.all([readFile(tmpPath), readFile(metaPath, 'utf8')]);
-    await rm(metaPath).catch(() => {});
-    const meta = JSON.parse(metaRaw) as { width: number; height: number };
-    console.log(`[captureScreen] ${tmpPath} (${meta.width}x${meta.height})`);
-    return { base64: data.toString('base64'), width: meta.width, height: meta.height };
-  }
-
-  // Linux / macOS: dimensions from Electron screen API
   const { width, height } = screen.getPrimaryDisplay().size;
-  if (process.platform === 'darwin') {
-    await execAsync(`screencapture -x -m "${tmpPath}"`);
-  } else {
-    // Linux: scrot with fallback to gnome-screenshot
-    await execAsync(`scrot -o "${tmpPath}"`).catch(() =>
-      execAsync(`gnome-screenshot -f "${tmpPath}"`)
-    );
-  }
-  const data = await readFile(tmpPath);
-  console.log(`[captureScreen] ${tmpPath} (${width}x${height})`);
-  return { base64: data.toString('base64'), width, height };
+  const thumbW = 1280;
+  const thumbH = Math.round(height * 1280 / width);
+
+  const sources = await desktopCapturer.getSources({
+    types: ['screen'],
+    thumbnailSize: { width: thumbW, height: thumbH },
+  });
+
+  const source = sources[0];
+  if (!source) throw new Error('desktopCapturer: nenhuma fonte de tela encontrada');
+
+  const jpegBuffer = source.thumbnail.toJPEG(80);
+  console.log(`[captureScreen] ${thumbW}x${thumbH} (tela real: ${width}x${height})`);
+  return { base64: jpegBuffer.toString('base64'), width, height };
 }
 
-// ── PowerShell helper: no quoting issues via -EncodedCommand ─────────────────
+// ── PowerShell helper: writes script to a temp .ps1 file to avoid AV false positives ──
 
 async function runPs(script: string, env?: Record<string, string>): Promise<void> {
-  const encoded = Buffer.from(script, 'utf16le').toString('base64');
+  const psPath = join(tmpdir(), `ai-ps-${Date.now()}.ps1`);
+  await writeFile(psPath, script, 'utf8');
   const opts = env ? { env: { ...process.env, ...env } } : undefined;
-  await execAsync(`powershell -NoProfile -EncodedCommand ${encoded}`, opts);
+  try {
+    await execAsync(`powershell -NoProfile -ExecutionPolicy Bypass -File "${psPath}"`, opts);
+  } finally {
+    await rm(psPath).catch(() => {});
+  }
 }
 
 // ── Mouse control ────────────────────────────────────────────────────────────
