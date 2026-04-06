@@ -193,7 +193,7 @@ export async function executeSteps(steps: AutomationStep[], screenWidth: number,
   for (const step of steps) {
     const x = Math.round(step.x_pct * screenWidth);
     const y = Math.round(step.y_pct * screenHeight);
-    console.log(`[automation] passo: x_pct=${step.x_pct} y_pct=${step.y_pct} → x=${x} y=${y} exclude=${step.need_exclude} text=${step.need_text} insert="${step.insert_text ?? ''}"`);
+    console.log(`[automation] passo: x_pct=${step.x_pct} y_pct=${step.y_pct} → x=${x} y=${y} exclude=${step.need_exclude} text=${step.need_text} insert="${step.insert_text ?? ''}" enter=${step.press_enter ?? false}`);
 
     await clickAt(x, y);
     await new Promise((r) => setTimeout(r, 500));
@@ -204,6 +204,11 @@ export async function executeSteps(steps: AutomationStep[], screenWidth: number,
 
     if (step.need_text && step.insert_text) {
       await typeText(step.insert_text);
+    }
+
+    if (step.press_enter) {
+      await new Promise((r) => setTimeout(r, 150));
+      await pressKey('enter');
     }
   }
 }

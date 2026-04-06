@@ -13,6 +13,7 @@ export interface AutomationStep {
   need_exclude: boolean;
   need_text: boolean;
   insert_text?: string;
+  press_enter?: boolean;
 }
 
 export interface ElectronAPI {

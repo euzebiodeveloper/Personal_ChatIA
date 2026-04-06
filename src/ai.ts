@@ -213,7 +213,8 @@ async function analyzeScreenForTask(
 
 Regras importantes:
 - Inclua TODOS os passos necessários para completar a tarefa do início ao fim.
-- Se a tarefa envolve pesquisar/buscar algo: inclua o passo de clicar no campo de busca, digitar o texto E clicar no botão de pesquisa/lupa/enter.
+- Se a tarefa envolve pesquisar/buscar algo dentro de um SITE (ex: buscar no YouTube, Amazon, Google): clique no campo de busca do site, digite o texto e confirme.
+- Se a tarefa envolve NAVEGAR para uma URL, mudar o link/endereço ou ir para outro site: clique na BARRA DE ENDEREÇOS DO NAVEGADOR. A barra de endereços fica no TOPO DA TELA, entre y_pct=0.03 e y_pct=0.06. NÃO use campos de busca dentro dos sites para isso.
 - Se a tarefa envolve preencher um formulário: inclua cada campo e o botão de enviar.
 - Nunca omita o passo final de confirmar/enviar/pesquisar.
 
@@ -224,7 +225,8 @@ Responda APENAS com um array JSON. Use x_pct e y_pct como valores decimais entre
     "y_pct": <posição vertical relativa, ex: 0.111>,
     "need_exclude": <true se precisa limpar o campo antes de digitar, false caso contrário>,
     "need_text": <true se precisa digitar algo, false caso contrário>,
-    "insert_text": "<texto a digitar, somente se need_text for true>"
+    "insert_text": "<texto a digitar, somente se need_text for true>",
+    "press_enter": <true se deve pressionar Enter após digitar (ex: barra de endereços do navegador, campo de busca sem botão), false caso contrário>
   }
 ]
 Não adicione nenhum texto além do array JSON.`
