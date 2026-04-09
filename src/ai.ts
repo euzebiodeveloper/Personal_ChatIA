@@ -1,6 +1,6 @@
 import OpenAI from 'openai';
 import type { BrowserWindow } from 'electron';
-import { executeAction, captureScreen, executeSteps } from './automation';
+import { executeAction, captureScreen, executeSteps, pressKeyCombo } from './automation';
 import type { ScreenCapture } from './automation';
 import { speak } from './tts';
 import type { AutomationStep } from './types';
@@ -191,6 +191,47 @@ Retorne APENAS o comando limpo começando com "Bruno,". Sem explicações adicio
   const result = (completion.choices[0]?.message?.content ?? '').trim();
   logger.info(`[layer0] normalização: "${raw}" → "${result}"`);
   return result || raw;
+}
+
+// ── Layer 0b: is the task a coherent instruction/question for Bruno? ─────────
+
+async function checkIfTaskIsCoherent(task: string): Promise<boolean> {
+  const client = getClient();
+  const completion = await client.chat.completions.create({
+    model: 'llama-3.1-8b-instant',
+    messages: [
+      {
+        role: 'system',
+        content: `Você decide se uma frase é uma instrução ou pergunta coerente direcionada ao assistente "Bruno" (controle de computador por voz, PT-BR).
+Responda APENAS "sim" se for uma instrução ou pergunta compreensível que Bruno pode executar ou responder.
+Responda "não" se for uma frase solta, comentário de fundo, despedida casual, afirmação sem sentido como comando, ou algo claramente que não é uma instrução.
+
+Exemplos de instruções coerentes (responda "sim"):
+- "Bruno, abre o Chrome." → sim
+- "Bruno, qual a capital do Brasil?" → sim
+- "Bruno, o que está na tela?" → sim
+- "Bruno, pesquisa por tênis no Google." → sim
+- "Bruno, como você está?" → sim
+- "Bruno, clica no botão enviar." → sim
+- "Bruno, fecha a janela." → sim
+
+Exemplos incoerentes como instrução (responda "não"):
+- "Bruno, continuo atendendo." → não
+- "Bruno, é isso mesmo." → não
+- "Bruno, tá certo." → não
+- "Bruno, com certeza." → não
+- "Bruno, pode ser." → não
+- "Bruno, muito obrigado." → não`,
+      },
+      { role: 'user', content: task },
+    ],
+    max_tokens: 5,
+    temperature: 0,
+  });
+  const answer = (completion.choices[0]?.message?.content ?? '').toLowerCase().trim();
+  const isCoherent = answer.includes('sim');
+  logger.info(`[layer0b] coerência: "${answer}" → coherent=${isCoherent}`);
+  return isCoherent;
 }
 
 // ── Layer 1a: is this a direct OS action that needs no screen capture? ────────
@@ -444,7 +485,7 @@ Responda APENAS com um array JSON:
 Não adicione nenhum texto além do array JSON.`
     : `Descreva em português brasileiro o que você está vendo nessa tela em no máximo 2 frases curtas e objetivas, como se estivesse descrevendo para alguém que não pode ver a tela. Seja direto e conciso.`;
 
-  // Vision model chain: OpenRouter (primary) → Gemini (fallback) → Groq (last resort)
+  // Vision model chain: OpenRouter (primary) → Groq (fallback) → Gemini (last resort)
   const OPENROUTER_MODEL = 'qwen/qwen3.6-plus:free';
   const GEMINI_MODEL = 'gemini-2.5-flash';
   const GROQ_VISION_MODEL = process.env.GROQ_VISION_MODEL ?? 'meta-llama/llama-4-scout-17b-16e-instruct';
@@ -456,22 +497,22 @@ Não adicione nenhum texto além do array JSON.`
     const result = await tryVisionProvider(openrouter, OPENROUTER_MODEL, prompt, capture, needsInteraction, 'OpenRouter');
     if (result !== null) raw = result;
   } else {
-    logger.info('[layer2] OPENROUTER_API_KEY não configurada — pulando para Gemini');
+    logger.info('[layer2] OPENROUTER_API_KEY não configurada — pulando para Groq');
+  }
+
+  if (!raw) {
+    const result = await tryVisionProvider(getClient(), GROQ_VISION_MODEL, prompt, capture, needsInteraction, 'Groq');
+    if (result !== null) raw = result;
   }
 
   if (!raw) {
     const gemini = getGeminiClient();
     if (gemini) {
-      const result = await tryVisionProvider(gemini, GEMINI_MODEL, prompt, capture, needsInteraction, 'Gemini');
-      if (result !== null) raw = result;
+      logger.info(`[layer2] fallback final: Gemini (${GEMINI_MODEL})`);
+      raw = await callVisionModel(gemini, GEMINI_MODEL, prompt, capture, needsInteraction);
     } else {
-      logger.info('[layer2] GEMINI_API_KEY não configurada — pulando para Groq');
+      logger.info('[layer2] GEMINI_API_KEY não configurada — nenhum provider disponível');
     }
-  }
-
-  if (!raw) {
-    logger.info(`[layer2] fallback final: Groq (${GROQ_VISION_MODEL})`);
-    raw = await callVisionModel(getClient(), GROQ_VISION_MODEL, prompt, capture, needsInteraction);
   }
 
   logger.info(`[layer2] resposta bruta: ${raw}`);
@@ -529,9 +570,34 @@ export async function processLayeredMessage(
       return { text: '' };
     }
 
+    // Browser navigation shortcuts — regex heuristic, no LLM needed, instant & precise
+    const BROWSER_NAV: Array<{ pattern: RegExp; combo: string; speech: string }> = [
+      { pattern: /voltar|volta|anterior|p[aá]gina anterior|page back|go back/i,   combo: 'alt+left',  speech: 'Voltando para a página anterior.' },
+      { pattern: /avan[çc]ar?|pr[oó]xima p[aá]gina|p[aá]gina seguinte|go forward/i, combo: 'alt+right', speech: 'Avançando para a próxima página.' },
+      { pattern: /recarreg|atualiz|refresh|reload|f5/i,                            combo: 'f5',        speech: 'Recarregando a página.' },
+      { pattern: /fechar\s*(a\s*)?aba|close\s*tab/i,                               combo: 'ctrl+w',    speech: 'Fechando a aba.' },
+      { pattern: /nova\s*aba|abrir\s*aba|new\s*tab/i,                              combo: 'ctrl+t',    speech: 'Abrindo nova aba.' },
+    ];
+    for (const nav of BROWSER_NAV) {
+      if (nav.pattern.test(lower)) {
+        logger.info(`[pipeline] atalho de navegação detectado: "${nav.combo}"`);
+        await pressKeyCombo(nav.combo);
+        await speakWithState(nav.speech, win);
+        return { text: nav.speech };
+      }
+    }
+
     // Layer 0: clean transcription — strip background audio, normalize Bruno variants
     const task = await normalizeTranscription(text);
     logger.info(`[pipeline] tarefa normalizada: "${task}"`);
+
+    // Layer 0b: coherence check — reject background noise / nonsensical phrases
+    const isCoherent = await checkIfTaskIsCoherent(task);
+    if (!isCoherent) {
+      logger.info(`[pipeline] tarefa incoerente descartada: "${task}"`);
+      await speakWithState('Não entendi bem o que você disse. Pode repetir de outra forma?', win);
+      return { text: '' };
+    }
 
     // Layer 1a: direct OS action? (open app, open URL, press key — no screen capture needed)
     const isDirectOS = await checkIfDirectOSAction(task);

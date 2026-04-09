@@ -157,6 +157,49 @@ async function pressKey(key: string): Promise<void> {
   }
 }
 
+export async function pressKeyCombo(combo: string): Promise<void> {
+  // combo format: "alt+left", "alt+right", "f5", "ctrl+w", "ctrl+t"
+  if (process.platform === 'win32') {
+    // SendKeys notation: % = Alt, ^ = Ctrl, + = Shift
+    const sendKeysMap: Record<string, string> = {
+      'alt+left':  '%{LEFT}',
+      'alt+right': '%{RIGHT}',
+      'f5':        '{F5}',
+      'ctrl+w':    '^w',
+      'ctrl+t':    '^t',
+      'ctrl+r':    '^r',
+    };
+    const sk = sendKeysMap[combo.toLowerCase()];
+    if (!sk) return;
+    const ps = `Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('${sk}')`;
+    await execAsync(`powershell -NoProfile -Command "${ps}"`).catch(() => {});
+  } else if (process.platform === 'darwin') {
+    const osascriptMap: Record<string, string> = {
+      'alt+left':  'keystroke (ASCII character 28) using {option down}',
+      'alt+right': 'keystroke (ASCII character 29) using {option down}',
+      'f5':        'key code 96',
+      'ctrl+w':    'keystroke "w" using {command down}',
+      'ctrl+t':    'keystroke "t" using {command down}',
+      'ctrl+r':    'keystroke "r" using {command down}',
+    };
+    const cmd = osascriptMap[combo.toLowerCase()];
+    if (!cmd) return;
+    await execAsync(`osascript -e 'tell application "System Events" to ${cmd}'`).catch(() => {});
+  } else {
+    const xdoMap: Record<string, string> = {
+      'alt+left':  'alt+Left',
+      'alt+right': 'alt+Right',
+      'f5':        'F5',
+      'ctrl+w':    'ctrl+w',
+      'ctrl+t':    'ctrl+t',
+      'ctrl+r':    'ctrl+r',
+    };
+    const xk = xdoMap[combo.toLowerCase()];
+    if (!xk) return;
+    await execAsync(`xdotool key ${xk}`).catch(() => {});
+  }
+}
+
 // ── Screen capture ───────────────────────────────────────────────────────────
 
 export interface ScreenCapture {
@@ -167,8 +210,8 @@ export interface ScreenCapture {
 
 export async function captureScreen(): Promise<ScreenCapture> {
   const { width, height } = screen.getPrimaryDisplay().size;
-  const thumbW = 1280;
-  const thumbH = Math.round(height * 1280 / width);
+  const thumbW = 960;
+  const thumbH = Math.round(height * 960 / width);
 
   const sources = await desktopCapturer.getSources({
     types: ['screen'],
@@ -178,7 +221,7 @@ export async function captureScreen(): Promise<ScreenCapture> {
   const source = sources[0];
   if (!source) throw new Error('desktopCapturer: nenhuma fonte de tela encontrada');
 
-  const jpegBuffer = source.thumbnail.toJPEG(80);
+  const jpegBuffer = source.thumbnail.toJPEG(75);
   console.log(`[captureScreen] ${thumbW}x${thumbH} (tela real: ${width}x${height})`);
   return { base64: jpegBuffer.toString('base64'), width, height };
 }
