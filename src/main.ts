@@ -6,6 +6,7 @@ import { setupTray } from './tray';
 import { processLayeredMessage, transcribeAudio } from './ai';
 import { logger } from './logger';
 import { saveSystemInfo } from './automation';
+import { startBridge } from './bridge';
 
 // Load API keys from project root .env (development) and userData/.env (production)
 dotenv.config();
@@ -54,6 +55,7 @@ function createWindow(): void {
 app.on('ready', () => {
   createWindow();
   saveSystemInfo().catch(console.error);
+  startBridge();
 
   if (!mainWindow) return;
   setupTray(mainWindow);

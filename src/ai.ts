@@ -1,7 +1,10 @@
 import OpenAI from 'openai';
 import type { BrowserWindow } from 'electron';
-import { executeAction, captureScreen, executeSteps, pressKeyCombo } from './automation';
+import { executeAction, captureScreen, executeSteps, pressKeyCombo, focusBrowserWindow, openNewBrowserTab } from './automation';
 import type { ScreenCapture } from './automation';
+import { getActiveWindow, executeFileSystemAction } from './context';
+import { isBrowserExtensionConnected, waitForExtension, queryDom, findDomByText, executeDomAction, findDomAndExecute, requestBrowserAction } from './bridge';
+import type { DomElement, DomAction } from './bridge';
 import { speak } from './tts';
 import type { AutomationStep } from './types';
 import { logger } from './logger';
@@ -9,7 +12,12 @@ import { logger } from './logger';
 let groqClient: OpenAI | null = null;
 let geminiClient: OpenAI | null = null;
 let openrouterClient: OpenAI | null = null;
+let togetherClient: OpenAI | null = null;
 
+// Simple in-process debounce/deduplication for pipeline tasks.
+const recentTaskTimestamps = new Map<string, number>();
+const activeTaskKeys = new Set<string>();
+const DUPLICATE_WINDOW_MS = 3000; // ms — ignore repeated identical tasks within this window
 function getClient(): OpenAI {
   if (!groqClient) {
     const apiKey = process.env.GROQ_API_KEY;
@@ -46,6 +54,18 @@ function getOpenRouterClient(): OpenAI | null {
   return openrouterClient;
 }
 
+function getTogetherClient(): OpenAI | null {
+  const apiKey = process.env.TOGETHER_API_KEY;
+  if (!apiKey) return null;
+  if (!togetherClient) {
+    togetherClient = new OpenAI({
+      baseURL: 'https://api.together.ai/v1',
+      apiKey,
+    });
+  }
+  return togetherClient;
+}
+
 const SYSTEM_PROMPT = `Você é um assistente de IA chamado Bruno que vive no desktop do usuário como um personagem animado em anime.
 Você é um assistente: calmo, tranquilo e educado. Fale sempre em português brasileiro.
 Seu nome é Bruno. Você é do gênero masculino (ele). Nunca se refira a si mesmo como "ela" ou use termos femininos.
@@ -58,7 +78,7 @@ Quando o usuário pedir para executar uma ação no computador, responda SOMENTE
 }
 
 Ações disponíveis:
-- "open_url": params = { "url": "https://..." } — use APENAS para abrir sites/URLs no navegador
+- "open_url": params = { "url": "https://...", "browser": "<chrome|firefox|edge>" (opcional) } — use para abrir sites/URLs no navegador; inclua "browser" se o usuário especificar qual navegador usar
 - "open_app": params = { "app": "<nome do executável do app>" } — use para abrir QUALQUER aplicativo instalado no PC (discord, word, excel, steam, obs, whatsapp, teams, vlc, notepad, calculator, explorer, spotify, chrome, firefox, vscode, etc.)
 - "press_key": params = { "key": "enter" | "escape" | "tab" | "f5" }
 
@@ -66,13 +86,20 @@ REGRA IMPORTANTE: Se o usuário pedir para abrir um APLICATIVO ou PROGRAMA do co
 
 Exemplos:
 - "Abre o YouTube" → { "action": "open_url", "params": { "url": "https://youtube.com" }, "speech": "Abrindo o YouTube." }
+- "Abre o YouTube no Chrome" → { "action": "open_url", "params": { "url": "https://youtube.com", "browser": "chrome" }, "speech": "Abrindo o YouTube no Chrome." }
+- "Abra o site da Amazon no navegador Google Chrome" → { "action": "open_url", "params": { "url": "https://amazon.com", "browser": "chrome" }, "speech": "Abrindo a Amazon no Chrome." }
 - "Pesquisa gatos no Google" → { "action": "open_url", "params": { "url": "https://www.google.com/search?q=gatos" }, "speech": "Pesquisando gatos no Google." }
+- "Pesquisa gatos no Google Chrome" → { "action": "open_url", "params": { "url": "https://www.google.com/search?q=gatos", "browser": "chrome" }, "speech": "Pesquisando gatos no Google Chrome." }
 - "Abre o Chrome" → { "action": "open_app", "params": { "app": "chrome" }, "speech": "Abrindo o Chrome." }
 - "Abre o VS Code" → { "action": "open_app", "params": { "app": "vscode" }, "speech": "Abrindo o VS Code." }
 - "Abre o Discord" → { "action": "open_app", "params": { "app": "discord" }, "speech": "Abrindo o Discord." }
 - "Abre o Word" → { "action": "open_app", "params": { "app": "word" }, "speech": "Abrindo o Word." }
 - "Abre o Steam" → { "action": "open_app", "params": { "app": "steam" }, "speech": "Abrindo o Steam." }
 - "Abre o WhatsApp" → { "action": "open_app", "params": { "app": "whatsapp" }, "speech": "Abrindo o WhatsApp." }
+- "Retorne para o YouTube" → { "action": "open_url", "params": { "url": "https://youtube.com" }, "speech": "Voltando para o YouTube." }
+- "Volte para o YouTube" → { "action": "open_url", "params": { "url": "https://youtube.com" }, "speech": "Voltando para o YouTube." }
+- "Vá para o YouTube" → { "action": "open_url", "params": { "url": "https://youtube.com" }, "speech": "Indo para o YouTube." }
+- "Me leva para o Netflix" → { "action": "open_url", "params": { "url": "https://netflix.com" }, "speech": "Abrindo o Netflix." }
 
 Para conversa normal (sem ação), responda como texto normal. Seja breve, calmo e educado.`;
 
@@ -151,49 +178,7 @@ export async function processTranscription(
   }
 }
 
-// ── Layer 0: clean transcription (strip background audio, validate intent) ───
-
-/**
- * Takes raw Whisper output and returns a cleaned command string, or null if
- * it is noise/incoherent. Handles two main problems:
- *   1. Background audio from speakers appended to the user's command
- *   2. Commands that are entirely noise / have no clear instruction
- */
-async function normalizeTranscription(raw: string): Promise<string> {
-  const client = getClient();
-  const completion = await client.chat.completions.create({
-    model: 'llama-3.1-8b-instant',
-    messages: [
-      {
-        role: 'system',
-        content: `Você processa transcrições de voz de um assistente chamado "Bruno" (controle de computador por voz, PT-BR).
-A transcrição pode conter frases de ruído de fundo (áudio de vídeo/TV tocando ao fundo misturado com a voz do usuário).
-IMPORTANTE: o reconhecedor de voz pode transcrever "Bruno" como "Bruna" ou "Buno". Trate essas palavras como equivalentes ao nome "Bruno".
-
-Sua tarefa:
-1. Extraia APENAS o comando que o usuário falou para Bruno. Remova apenas frases que sejam CLARAMENTE ruído de fundo de outra pessoa falando ao fundo.
-2. PRESERVE INTEGRALMENTE todos os argumentos do comando: nomes, termos de busca, URLs, textos a digitar, números — NADA deve ser removido ou abreviado.
-3. Retorne o comando completo substituindo qualquer variante do nome (Bruna, Buno) pelo texto "Bruno,".
-
-Exemplos corretos:
-- "Bruno, pesquisa Vinícius 13." → "Bruno, pesquisa Vinícius 13."
-- "Bruno abre o YouTube." → "Bruno, abre o YouTube."
-- "Bruno aqui no site da Amazon seleciona o tamanho P." → "Bruno, aqui no site da Amazon seleciona o tamanho P."
-- "Bruna digita olá mundo no campo de texto." → "Bruno, digita olá mundo no campo de texto."
-
-Retorne APENAS o comando limpo começando com "Bruno,". Sem explicações adicionais.`,
-      },
-      { role: 'user', content: raw },
-    ],
-    max_tokens: 150,
-    temperature: 0,
-  });
-  const result = (completion.choices[0]?.message?.content ?? '').trim();
-  logger.info(`[layer0] normalização: "${raw}" → "${result}"`);
-  return result || raw;
-}
-
-// ── Layer 0b: is the task a coherent instruction/question for Bruno? ─────────
+// ── Layer 0b: is the transcription a coherent command/question? ─────────────
 
 async function checkIfTaskIsCoherent(task: string): Promise<boolean> {
   const client = getClient();
@@ -202,34 +187,46 @@ async function checkIfTaskIsCoherent(task: string): Promise<boolean> {
     messages: [
       {
         role: 'system',
-        content: `Você decide se uma frase é uma instrução ou pergunta coerente direcionada ao assistente "Bruno" (controle de computador por voz, PT-BR).
-Responda APENAS "sim" se for uma instrução ou pergunta compreensível que Bruno pode executar ou responder.
-Responda "não" se for uma frase solta, comentário de fundo, despedida casual, afirmação sem sentido como comando, ou algo claramente que não é uma instrução.
+        content: `Você é um classificador binário. Sua ÚNICA função é decidir se uma transcrição de voz é uma instrução ou pergunta coerente (PT-BR).
+RESPONDA EXCLUSIVAMENTE com a palavra "sim" ou a palavra "não". NENHUMA outra palavra. NENHUMA explicação. NENHUMA pontuação.
 
-Exemplos de instruções coerentes (responda "sim"):
-- "Bruno, abre o Chrome." → sim
-- "Bruno, qual a capital do Brasil?" → sim
-- "Bruno, o que está na tela?" → sim
-- "Bruno, pesquisa por tênis no Google." → sim
-- "Bruno, como você está?" → sim
-- "Bruno, clica no botão enviar." → sim
-- "Bruno, fecha a janela." → sim
+Regra: responda "sim" se o texto for uma instrução, pedido ou pergunta que um assistente pode executar ou responder.
+Responda "não" se for ruído, frase solta, comentário sem sentido como comando, ou resposta afirmativa genérica.
 
-Exemplos incoerentes como instrução (responda "não"):
-- "Bruno, continuo atendendo." → não
-- "Bruno, é isso mesmo." → não
-- "Bruno, tá certo." → não
-- "Bruno, com certeza." → não
-- "Bruno, pode ser." → não
-- "Bruno, muito obrigado." → não`,
+Exemplos:
+"Abre o Chrome." → sim
+"Qual a capital do Brasil?" → sim
+"O que está na tela?" → sim
+"Pesquisa por tênis no Google." → sim
+"Como você está?" → sim
+"Clica no botão enviar." → sim
+"Fecha a janela." → sim
+"Preenche esse formulário com dados fictícios." → sim
+"Consegue preencher esse formulário para mim?" → sim
+"Você consegue preencher todo esse formulário com dados específicos?" → sim
+"Clique no vídeo com o cavalo." → sim
+"Retorne para o YouTube." → sim
+"Continuo atendendo." → não
+"É isso mesmo." → não
+"Tá certo." → não
+"Com certeza." → não
+"Pode ser." → não
+"Muito obrigado." → não
+"Obrigado." → não
+"Obrigada." → não
+"E aí" → não
+"Hum." → não`,
       },
       { role: 'user', content: task },
     ],
-    max_tokens: 5,
+    max_tokens: 3,
     temperature: 0,
   });
   const answer = (completion.choices[0]?.message?.content ?? '').toLowerCase().trim();
-  const isCoherent = answer.includes('sim');
+  // Accept "sim" explicitly; treat anything that isn't clearly "não" as coherent
+  // to avoid false negatives (e.g. model returning "sim, ..." or "claro")
+  const isIncoherent = answer.startsWith('não') || answer.startsWith('nao');
+  const isCoherent = !isIncoherent;
   logger.info(`[layer0b] coerência: "${answer}" → coherent=${isCoherent}`);
   return isCoherent;
 }
@@ -248,7 +245,8 @@ Responda APENAS "sim" se a tarefa pode ser executada DIRETAMENTE pelo sistema op
 
 São ações diretas do SO — responda "sim":
 - Abrir aplicativos instalados (calculadora, Excel, Word, Chrome, Discord, Steam, VS Code, Spotify, WhatsApp, Notepad, Paint, etc.)
-- Abrir sites ou URLs (YouTube, Google, Amazon, GitHub, etc.)
+- Abrir sites ou URLs (YouTube, Google, Amazon, GitHub, etc.) — com ou sem especificar o navegador
+- Navegar para um site em um navegador específico (Chrome, Firefox, Edge, etc.)
 - Pesquisar algo no Google ou na web
 - Pressionar teclas do teclado (Enter, Escape, Tab, F5, etc.)
 - Minimizar, maximizar ou fechar a janela ativa
@@ -265,7 +263,13 @@ Exemplos:
 "Abre a calculadora" → sim
 "Abre o Chrome" → sim
 "Abre o YouTube" → sim
+"Abre o YouTube no Chrome" → sim
+"Abre o site da Amazon" → sim
+"Abra o site da Amazon no navegador Google Chrome" → sim
+"Agora abra o site da Amazon no navegador Google Chrome" → sim
+"Abre o Netflix no Firefox" → sim
 "Pesquisa gatos no Google" → sim
+"Pesquisa gatos no Google Chrome" → sim
 "Abre o Discord" → sim
 "Abre o Word" → sim
 "Abre o Steam" → sim
@@ -273,6 +277,8 @@ Exemplos:
 "Abre o VS Code" → sim
 "Clica no botão enviar" → não
 "Seleciona o tamanho P" → não
+"Seleciona a opção CSS3" → não
+"Marque o checkbox HTML5" → não
 "Preenche o campo de nome com João" → não
 "O que está na minha tela?" → não
 "Mude o select de 1 para 2" → não
@@ -485,31 +491,23 @@ Responda APENAS com um array JSON:
 Não adicione nenhum texto além do array JSON.`
     : `Descreva em português brasileiro o que você está vendo nessa tela em no máximo 2 frases curtas e objetivas, como se estivesse descrevendo para alguém que não pode ver a tela. Seja direto e conciso.`;
 
-  // Vision model chain: OpenRouter (primary) → Groq (fallback) → Gemini (last resort)
-  const OPENROUTER_MODEL = 'qwen/qwen3.6-plus:free';
-  const GEMINI_MODEL = 'gemini-2.5-flash';
-  const GROQ_VISION_MODEL = process.env.GROQ_VISION_MODEL ?? 'meta-llama/llama-4-scout-17b-16e-instruct';
+  // Vision model chain:
+  //   1. Groq  meta-llama/llama-4-scout-17b-16e-instruct
+  //   2. Gemini 2.5 Flash (last resort)
+  const GROQ_VISION_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct';
+  const GEMINI_25_MODEL   = 'gemini-2.5-flash';
 
   let raw = '';
 
-  const openrouter = getOpenRouterClient();
-  if (openrouter) {
-    const result = await tryVisionProvider(openrouter, OPENROUTER_MODEL, prompt, capture, needsInteraction, 'OpenRouter');
-    if (result !== null) raw = result;
-  } else {
-    logger.info('[layer2] OPENROUTER_API_KEY não configurada — pulando para Groq');
-  }
-
-  if (!raw) {
-    const result = await tryVisionProvider(getClient(), GROQ_VISION_MODEL, prompt, capture, needsInteraction, 'Groq');
-    if (result !== null) raw = result;
-  }
+  const groq = getClient();
+  const groqResult = await tryVisionProvider(groq, GROQ_VISION_MODEL, prompt, capture, needsInteraction, 'Groq (Llama 4 Scout)');
+  if (groqResult !== null) raw = groqResult;
 
   if (!raw) {
     const gemini = getGeminiClient();
     if (gemini) {
-      logger.info(`[layer2] fallback final: Gemini (${GEMINI_MODEL})`);
-      raw = await callVisionModel(gemini, GEMINI_MODEL, prompt, capture, needsInteraction);
+      const result = await tryVisionProvider(gemini, GEMINI_25_MODEL, prompt, capture, needsInteraction, 'Gemini 2.5 Flash');
+      if (result !== null) raw = result;
     } else {
       logger.info('[layer2] GEMINI_API_KEY não configurada — nenhum provider disponível');
     }
@@ -547,6 +545,737 @@ Não adicione nenhum texto além do array JSON.`
   return raw;
 }
 
+// ── DOM action resolver (browser path) ──────────────────────────────────────
+
+// ── DOM action resolver ──────────────────────────────────────────────────────
+
+/** Synonym map for common UI action keywords (PT ↔ EN and nicknames). */
+const CLICK_SYNONYMS: Record<string, string[]> = {
+  play:        ['play', 'reproduzir', 'iniciar', 'reprodução', 'assistir', 'tocar', 'resume'],
+  pause:       ['pause', 'pausar', 'parar', 'stop'],
+  like:        ['like', 'gostei', 'curtir', 'curtiu', 'gostar'],
+  dislike:     ['dislike', 'não gostei', 'descurtir'],
+  subscribe:   ['subscribe', 'inscrever', 'inscreva', 'inscrição'],
+  sininho:     ['sininho', 'notificação', 'notification', 'bell', 'notify'],
+  share:       ['share', 'compartilhar', 'compartilhe'],
+  save:        ['save', 'salvar', 'salve'],
+  fullscreen:  ['fullscreen', 'tela cheia', 'maximizar', 'expand'],
+  mute:        ['mute', 'mutar', 'silenciar', 'silencioso'],
+  unmute:      ['unmute', 'desmutar', 'ativar som', 'som'],
+  next:        ['next', 'próximo', 'avançar'],
+  previous:    ['previous', 'anterior', 'voltar'],
+  close:       ['close', 'fechar', 'fecha', 'x'],
+  send:        ['send', 'enviar', 'envie', 'submit'],
+  login:       ['login', 'entrar', 'sign in', 'signin'],
+  logout:      ['logout', 'sair', 'sign out'],
+  confirm:     ['confirm', 'confirmar', 'ok', 'yes', 'sim'],
+  cancel:      ['cancel', 'cancelar', 'não', 'no'],
+  add:         ['add', 'adicionar', 'adicione'],
+  remove:      ['remove', 'remover', 'excluir', 'deletar', 'delete'],
+  menu:        ['menu', 'hamburguer', 'nav'],  // 'guia' removido — é sinônimo de 'aba/tab' no contexto PT-BR
+  settings:    ['settings', 'configurações', 'config', 'opções'],
+  download:    ['download', 'baixar', 'baixe'],
+};
+
+// Flat list of all synonyms for quick intent detection
+const ALL_CLICK_TARGETS = Object.values(CLICK_SYNONYMS).flat();
+
+/** Classify task intent to determine which element types are relevant. */
+function classifyDomIntent(task: string): 'search' | 'type' | 'click' | 'select' | 'fill_form' | 'unknown' {
+  // Form fill: must check before generic type/preenche so it gets priority
+  if (/formulár|formulari|todos.*campos?|preenche.*(?:todo|formulár|form)|(?:todo|formulár|form).*preenche/i.test(task)) return 'fill_form';
+  if (/pesquis|busca|procura|search/i.test(task)) return 'search';
+  if (/digit|escrev|preenche|insere|coloca|type|fill/i.test(task)) return 'type';
+  // "selecione/selecionar" no contexto web = clicar em produto/link, não <select> dropdown
+  if (/cliq(?:ue|ui|a)|pressiona|aperta|click|press|enviar|submit|ativ[ae]|aciona|habilit|liga\b|selecione?r?|escolha\b/i.test(task)) return 'click';
+  // <select> dropdown: precisa mencionar explicitamente opção/dropdown
+  if (/seleciona\s+(?:a\s+)?op[çc][aã]o|dropdown|select.*option|choose.*option/i.test(task)) return 'select';
+
+  // Intent by target noun — even without a verb, these imply click
+  const words = task.toLowerCase().split(/[\s,./]+/);
+  if (words.some(w => ALL_CLICK_TARGETS.includes(w))) return 'click';
+
+  return 'unknown';
+}
+
+// ── Layer 1-DOM: AI-driven intent resolution (fallback when regex is ambiguous) ─
+async function resolveAiDomIntent(task: string): Promise<'search' | 'click' | 'type' | 'select' | 'fill_form' | 'unknown'> {
+  const client = getClient();
+  const completion = await client.chat.completions.create({
+    model: 'llama-3.1-8b-instant',
+    messages: [
+      {
+        role: 'system',
+        content: `Você analisa uma instrução de automação web e decide qual ação DOM executar.
+Responda APENAS com uma dessas palavras: search | click | type | select | fill_form
+
+- search: buscar/pesquisar algo (digitar no campo de busca e submeter)
+- click: clicar em elemento específico, produto, link, botão, imagem ou item de lista
+- type: digitar/preencher um campo sem submeter
+- select: escolher opção de um menu dropdown HTML (<select>)
+- fill_form: preencher todos os campos de um formulário inteiro
+
+Exemplos:
+"pesquise camisa branca" → search
+"selecione a camisa amarela" → click
+"clique no produto" → click
+"escolha a cor azul no dropdown" → select
+"preencha o nome com João" → type
+"ative o filtro de preço" → click
+"coloque o CEP no campo" → type
+"preencha esse formulário com dados fictícios" → fill_form
+"consegue preencher todo esse formulário?" → fill_form
+"preencha todos os campos do formulário" → fill_form`,
+      },
+      { role: 'user', content: task },
+    ],
+    max_tokens: 10,
+    temperature: 0,
+  });
+  const answer = (completion.choices[0]?.message?.content ?? '').toLowerCase().trim();
+  const INTENTS = ['search', 'click', 'type', 'select', 'fill_form'] as const;
+  const found = INTENTS.find(i => answer.includes(i));
+  logger.info(`[layer1dom] intenção DOM via IA: "${answer}" → intent=${found ?? 'unknown'}`);
+  return found ?? 'unknown';
+}
+
+// ── Vision-assisted click target identification ──────────────────────────────
+/**
+ * Sends a screenshot to Groq's vision model (llama-4-scout) and asks it to
+ * identify the visible text / label of the element that should be clicked.
+ * Returns { phrase: raw text, keywords: filtered meaningful words }.
+ */
+async function identifyClickTargetViaVision(
+  task: string,
+  capture: ScreenCapture,
+): Promise<{ phrase: string; keywords: string[] }> {
+  const client = getClient(); // Groq
+  try {
+    const completion = await client.chat.completions.create({
+      model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'image_url',
+              image_url: { url: `data:image/jpeg;base64,${capture.base64}` },
+            },
+            {
+              type: 'text',
+              text: `Task: "${task}"
+
+Look at this screenshot. What is the EXACT visible text, title or identifier of the element that should be clicked to complete this task?
+Reply with ONLY that text (max 20 words). No explanation, no punctuation beyond the text itself.`,
+            },
+          ],
+        },
+      ],
+      max_tokens: 60,
+      temperature: 0,
+    });
+    const phrase = (completion.choices[0]?.message?.content ?? '').toLowerCase().trim();
+    logger.info(`[vision-click] Groq Scout identificou: "${phrase}"`);
+    // PT-BR + EN stop words — words that are too common to be useful as identifiers
+    const STOP = /^(?:no|na|em|o|a|os|as|um|uma|the|in|on|at|de|do|da|dos|das|para|pra|por|com|and|or|e|ou|click|clique|button|botão|link|produto|element|elemento|is|are|that|this|which|would|should|que|essa|esse|este|esta|isso|isto|aqui|ali|tinha|sido|estar|estava|ter|foi|ser|pelo|pela|pelos|pelas|num|numa|neste|nesta|nessa|nesse|todo|toda|todos|todas|muito|muita|muitos|muitas|mais|menos|bem|mal|ainda|também|mesmo|quando|onde|como|porque|pois|mas|nem|se|seu|sua|seus|suas|meu|minha|tudo|algo|cada|eles|elas|ele|ela|foi|vai|tem|vem|bem|nao|nao|sim|nós)$/i;
+    const keywords = phrase
+      .split(/[\s,.\-–/]+/)
+      .map(w => w.replace(/[^a-zA-ZÀ-ú0-9]/g, '').toLowerCase())
+      .filter(w => w.length > 1 && !STOP.test(w));
+    logger.info(`[vision-click] keywords filtrados: [${keywords.join(', ')}]`);
+    return { phrase, keywords };
+  } catch (err: any) {
+    logger.warn(`[vision-click] Groq Scout falhou: ${err.message}`);
+    return { phrase: '', keywords: [] };
+  }
+}
+
+/** Expand keywords with synonyms (both directions). */
+function expandWithSynonyms(keywords: string[]): string[] {
+  const expanded = new Set(keywords);
+  for (const kw of keywords) {
+    // Check if kw is in any synonym group
+    for (const [, synonyms] of Object.entries(CLICK_SYNONYMS)) {
+      if (synonyms.includes(kw)) {
+        synonyms.forEach(s => expanded.add(s));
+        break;
+      }
+    }
+  }
+  return Array.from(expanded);
+}
+
+/** Extract target keywords from a click task (what the user wants to click on). */
+function extractClickKeywords(task: string): string[] {
+  // Strip verb phrases to get the target noun/label
+  const stripped = task
+    .replace(/^(?:por favor[,\s]+)?(?:cliq(?:ue|ui|a)|pressiona|aperta|click|press|ativ[ae]|aciona|habilit|liga)\s+(?:no|na|em|o|a|the)?\s*/i, '')
+    .replace(/(?:\s+(?:aqui|agora|por favor|please))+$/i, '')
+    .trim();
+
+  // Split into tokens, remove stop words
+  const STOP = /^(?:no|na|em|o|a|os|as|um|uma|the|in|on|at|de|do|da|dos|das|para|pra|por|com|vídeo|video|youtube|página|page|site|botão|button|ícone|icon)$/i;
+  const keywords = stripped
+    .split(/[\s,./]+/)
+    .map(w => w.replace(/[^a-zA-ZÀ-ú0-9]/g, '').toLowerCase())
+    .filter(w => w.length > 1 && !STOP.test(w));
+
+  return keywords;
+}
+
+/** Score a clickable element against target keywords. */
+function scoreClickCandidate(el: DomElement, keywords: string[]): number {
+  if (keywords.length === 0) return 0;
+  const haystack = [el.text, el.ariaLabel, el.id, el.name, el.selector, el.href]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+
+  // Score keywords against individual label fields to distinguish exact from substring
+  // e.g. "play" should score "Play" (exact) higher than "Playlist" (substring)
+  const normText  = (el.text     ?? '').toLowerCase().trim();
+  const normAria  = (el.ariaLabel ?? '').toLowerCase().trim();
+
+  const kwScore = (src: string, kw: string): number => {
+    if (!src) return 0;
+    if (src === kw) return 30;
+    const idx = src.indexOf(kw);
+    if (idx === -1) return 0;
+    const before = idx === 0 || src[idx - 1] === ' ';
+    const after  = idx + kw.length === src.length || src[idx + kw.length] === ' ';
+    if (before && after) return 20;
+    return 5;
+  };
+
+  let score = 0;
+  for (const kw of keywords) {
+    const labelScore = Math.max(kwScore(normText, kw), kwScore(normAria, kw));
+    if (labelScore > 0) {
+      score += labelScore;
+    } else if (haystack.includes(kw)) {
+      // Fallback: match anywhere (selector, id, href) — lower weight
+      score += 3;
+    } else if (kw.length >= 4 && haystack.split(/\s+/).some(w => w.startsWith(kw) || kw.startsWith(w))) {
+      score += 2;
+    }
+  }
+  return score;
+}
+
+
+function scoreSearchInput(el: DomElement): number {
+  if (el.tag !== 'input' && el.tag !== 'textarea') return -1;
+  const isTextType = !el.type || ['text', 'search', ''].includes(el.type ?? '');
+  if (!isTextType) return -1;
+
+  let score = 0;
+  const SEMANTIC = /search|busca|pesquis|query|keyword|consulta|procura/i;
+  const STRUCTURAL = /search|query|keyword|busca|pesquis/i;
+
+  // Layer 1: semantic — placeholder and aria-label (highest confidence signals)
+  if (SEMANTIC.test(el.placeholder ?? '')) score += 10;
+  if (SEMANTIC.test(el.ariaLabel ?? '')) score += 10;
+  if (SEMANTIC.test(el.name ?? '')) score += 8;
+  // Layer 2: structural — id, role, type
+  if (STRUCTURAL.test(el.id ?? '')) score += 8;
+  if (el.type === 'search') score += 15;
+  if (el.role === 'searchbox') score += 12;
+  // Bonus: data attributes hinting at search (agent patched fields)
+  if (STRUCTURAL.test(el.selector)) score += 3;
+
+  return score;
+}
+
+/** Score an element for search-submit relevance. */
+function scoreSearchSubmit(el: DomElement): number {
+  const isSubmittable =
+    (el.tag === 'input' && (el.type === 'submit' || el.type === 'button')) ||
+    el.tag === 'button';
+  if (!isSubmittable) return -1;
+
+  let score = 0;
+  const SEMANTIC = /search|go|buscar|pesquisar|submit|procurar|lupa|magnif/i;
+  const STRUCTURAL = /search|submit|query|busca|pesquis/i;
+
+  // Layer 1: semantic
+  if (SEMANTIC.test(el.text ?? '')) score += 10;
+  if (SEMANTIC.test(el.ariaLabel ?? '')) score += 10;
+  // Layer 2: structural
+  if (STRUCTURAL.test(el.id ?? '')) score += 10;
+  if (el.type === 'submit') score += 6;
+  if (STRUCTURAL.test(el.selector)) score += 3;
+
+  return score;
+}
+
+/** Smart element filter using semantic + structural scoring.
+ *  Returns the top candidates and whether the result is high-confidence (can skip AI). */
+function smartFilterElements(
+  elements: DomElement[],
+  intent: string,
+  task: string,
+  visionKeywords?: string[],
+): { filtered: DomElement[]; offsetMap: number[]; highConfidence: boolean } {
+  // Noise filter: media controls that are irrelevant for non-click tasks
+  const NOISE_LABEL = /replay|unmute|mute|fullscreen|volume|seek|captions|subtitles|picture.in.picture|rewind|fast.forward/i;
+  const NOISE_SELECTOR = /carousel|slider/i;
+
+  const denoised = intent === 'click'
+    ? elements  // for explicit click tasks, keep everything — user said to click something specific
+    : elements.filter(el =>
+        !NOISE_LABEL.test(el.text ?? '') &&
+        !NOISE_LABEL.test(el.ariaLabel ?? '') &&
+        !NOISE_SELECTOR.test(el.selector),
+      );
+  if (intent === 'search') {
+    // Score every input for search relevance
+    const inputScores = denoised.map((el, i) => ({ el, i: elements.indexOf(el), score: scoreSearchInput(el) }))
+      .filter(x => x.score > 0)
+      .sort((a, b) => b.score - a.score);
+
+    const submitScores = denoised.map((el, i) => ({ el, i: elements.indexOf(el), score: scoreSearchSubmit(el) }))
+      .filter(x => x.score > 0)
+      .sort((a, b) => b.score - a.score);
+
+    const bestInput = inputScores[0];
+    const bestSubmit = submitScores[0];
+
+    // High confidence: clear search input + submit button found
+    if (bestInput && bestInput.score >= 8 && bestSubmit && bestSubmit.score >= 6) {
+      logger.info(`[dom-filter] high-confidence search: input=[${bestInput.i}] score=${bestInput.score} "${bestInput.el.placeholder ?? bestInput.el.ariaLabel ?? bestInput.el.id}" | submit=[${bestSubmit.i}] score=${bestSubmit.score} "${bestSubmit.el.text ?? bestSubmit.el.ariaLabel ?? bestSubmit.el.id}"`);
+      return {
+        filtered: [bestInput.el, bestSubmit.el],
+        offsetMap: [bestInput.i, bestSubmit.i],
+        highConfidence: true,
+      };
+    }
+
+    // Medium confidence: at least a search input found — add all submit buttons
+    if (bestInput && bestInput.score >= 5) {
+      const allSubmits = denoised.map((el) => ({ el, i: elements.indexOf(el) }))
+        .filter(({ el }) => (el.tag === 'input' && ['submit', 'button'].includes(el.type ?? '')) || el.tag === 'button');
+      const combined = [{ el: bestInput.el, i: bestInput.i }, ...allSubmits.slice(0, 10)];
+      return { filtered: combined.map(x => x.el), offsetMap: combined.map(x => x.i), highConfidence: false };
+    }
+
+    // Fallback: all text inputs + buttons from denoised
+    const fallback = denoised.map((el) => ({ el, i: elements.indexOf(el) })).filter(({ el }) =>
+      (el.tag === 'input' && (!el.type || ['text', 'search', 'submit', 'button'].includes(el.type ?? ''))) ||
+      el.tag === 'button' || el.tag === 'textarea',
+    );
+    return { filtered: fallback.map(x => x.el), offsetMap: fallback.map(x => x.i), highConfidence: false };
+  }
+
+  if (intent === 'fill_form') {
+    // Return ALL form-fillable elements: text/email/date/number inputs, textarea,
+    // select, radio, checkbox, and the submit button.
+    const formEls = denoised.map((el) => ({ el, i: elements.indexOf(el) })).filter(({ el }) => {
+      if (el.tag === 'textarea') return true;
+      if (el.tag === 'select') return true;
+      if (el.tag === 'button' && (el.type === 'submit' || !el.type)) return true;
+      if (el.tag === 'input') {
+        const t = el.type ?? '';
+        return ['text', 'email', 'password', 'tel', 'url', 'date', 'number', 'radio', 'checkbox', 'search', ''].includes(t);
+      }
+      return false;
+    });
+    if (formEls.length === 0) return { filtered: denoised.slice(0, 40), offsetMap: denoised.slice(0, 40).map(el => elements.indexOf(el)), highConfidence: false };
+    return { filtered: formEls.map(x => x.el), offsetMap: formEls.map(x => x.i), highConfidence: false };
+  }
+
+  if (intent === 'type') {
+    const inputs = denoised.map((el) => ({ el, i: elements.indexOf(el) })).filter(({ el }) =>
+      (el.tag === 'input' && (!el.type || ['text', 'search', 'email', 'password', 'tel', 'url', 'date', 'number', ''].includes(el.type ?? ''))) ||
+      el.tag === 'textarea',
+    );
+    if (inputs.length === 0) return { filtered: denoised.slice(0, 30), offsetMap: denoised.slice(0, 30).map(el => elements.indexOf(el)), highConfidence: false };
+    return { filtered: inputs.map(x => x.el), offsetMap: inputs.map(x => x.i), highConfidence: false };
+  }
+
+  if (intent === 'click') {
+    // keep all elements (denoised === elements for click intent), filter to clickables
+    // Include role="button" elements (Amazon size swatches, custom UI components, etc.)
+    const btns = elements.map((el, i) => ({ el, i })).filter(({ el }) =>
+      el.tag === 'button' || el.tag === 'a' ||
+      (el.tag === 'input' && ['submit', 'button'].includes(el.type ?? '')) ||
+      el.role === 'button' || el.role === 'option' || el.role === 'radio',
+    );
+    if (btns.length === 0) return { filtered: elements.slice(0, 30), offsetMap: elements.slice(0, 30).map((_, i) => i), highConfidence: false };
+
+    // Score buttons by keyword match — merge vision keywords (precise) with task keywords (fallback)
+    const taskKeywords = extractClickKeywords(task ?? '');
+    const mergedRaw = (visionKeywords && visionKeywords.length > 0)
+      ? [...new Set([...visionKeywords, ...taskKeywords])]
+      : taskKeywords;
+    const keywords = expandWithSynonyms(mergedRaw);
+    logger.info(`[dom-filter] click keywords (vision=${visionKeywords?.length ?? 0} task=${taskKeywords.length}): [${keywords.join(', ')}]`);
+    const scored = btns.map(({ el, i }) => ({ el, i, score: scoreClickCandidate(el, keywords) }));
+    scored.sort((a, b) => b.score - a.score);
+
+    const best = scored[0];
+    // High confidence: top candidate has a clear keyword match
+    if (best && best.score >= 10) {
+      logger.info(`[dom-filter] high-confidence click: [${best.i}] score=${best.score} text="${best.el.text}" aria="${best.el.ariaLabel ?? ''}"`);
+      return { filtered: [best.el], offsetMap: [best.i], highConfidence: true };
+    }
+
+    // Send top 15 candidates to AI (already sorted by relevance)
+    const top = scored.slice(0, 15);
+    return { filtered: top.map(x => x.el), offsetMap: top.map(x => x.i), highConfidence: false };
+  }
+
+  if (intent === 'select') {
+    const selects = denoised.map((el) => ({ el, i: elements.indexOf(el) })).filter(({ el }) => el.tag === 'select');
+    if (selects.length === 0) return { filtered: denoised.slice(0, 30), offsetMap: denoised.slice(0, 30).map(el => elements.indexOf(el)), highConfidence: false };
+    return { filtered: selects.map(x => x.el), offsetMap: selects.map(x => x.i), highConfidence: false };
+  }
+
+  // unknown: denoised, capped at 40
+  return { filtered: denoised.slice(0, 40), offsetMap: denoised.slice(0, 40).map(el => elements.indexOf(el)), highConfidence: false };
+}
+
+/** Extract the search/type value from the task string via regex. */
+function extractTypingValue(task: string): string | null {
+  // "pesquise camisa" → "camisa"; "busca camisas vermelhas" → "camisas vermelhas"
+  // pesquis[ae]r? covers pesquisa / pesquise / pesquisar
+  const m = task.match(/(?:pesquis[ae]r?|busca[r]?|procura[r]?|search|digit[ae]|escrev[ae]|preenche[r]?|insir[ae]|coloca[r]?|type|fill)\s+(.+?)(?:\s+(?:no|na|em|in|no\s+site|na\s+barra|no\s+campo|no\s+input).*)?$/i);
+  if (!m) return null;
+  const raw = m[1].trim();
+  // Reject if the extraction is noisy (starts with discourse tokens or is very long)
+  const NOISE_START = /^(?:e\s|a\s|o\s|não|para|que|só|apenas|já|aí|isso|aqui|também)/i;
+  if (NOISE_START.test(raw) || raw.split(' ').length > 6) return null;
+  return raw;
+}
+
+/** Ask LLM to extract only the search term from a conversational command. */
+async function extractSearchTermViaAI(task: string): Promise<string> {
+  const client = getClient();
+  const completion = await client.chat.completions.create({
+    model: 'llama-3.1-8b-instant',
+    messages: [
+      {
+        role: 'system',
+        content: `Extraia APENAS o termo de busca da frase do usuário. Responda somente o termo, sem pontuação, sem explicação.
+
+Exemplos:
+"pesquise camisa branca" → camisa branca
+"agora pesquisa e calça" → calça
+"Não, é para pesquisar calça apenas." → calça
+"busca tênis Nike" → tênis Nike
+"procura por notebook gamer" → notebook gamer
+"quero buscar camiseta polo masculina" → camiseta polo masculina`,
+      },
+      { role: 'user', content: task },
+    ],
+    max_tokens: 20,
+    temperature: 0,
+  });
+  const result = (completion.choices[0]?.message?.content ?? '').trim();
+  logger.info(`[extract-search] IA extraiu: "${result}"`);
+  return result || task;
+}
+
+/** Infer the DOM action from an element's tag/type/role, without needing AI. */
+function inferActionFromElement(el: DomElement): DomAction {
+  if (el.tag === 'select') return { kind: 'select', value: el.text ?? '' };
+  // Typeable inputs (text-like + date/number)
+  if (el.tag === 'input' && (!el.type || ['text', 'search', 'email', 'password', 'tel', 'url', 'date', 'number'].includes(el.type))) {
+    return { kind: 'type', value: '', clearFirst: true };
+  }
+  // textarea
+  if (el.tag === 'textarea') return { kind: 'type', value: '', clearFirst: true };
+  // Everything else (button, a, input[submit/radio/checkbox], role=button/option/radio): click
+  return { kind: 'click' };
+}
+
+/**
+ * Try to find the target element by direct text/label match against vision keywords.
+ * Returns the first element whose text contains ALL vision keywords (case-insensitive).
+ * Prefers exact matches over partial, and shorter text over longer (more specific).
+ */
+function resolveByLabelMatch(
+  elements: DomElement[],
+  visionKeywords: string[],
+): { selector: string; action: DomAction } | null {
+  if (visionKeywords.length === 0) return null;
+
+  const lower = visionKeywords.map(k => k.toLowerCase());
+
+  const candidates = elements
+    .map((el, i) => ({ el, i }))
+    .filter(({ el }) => {
+      const hay = `${(el.text ?? '').toLowerCase()} ${(el.ariaLabel ?? '').toLowerCase()}`.trim();
+      if (!hay) return false;
+      return lower.every(kw => hay.includes(kw));
+    });
+
+  if (candidates.length === 0) return null;
+
+  // Prefer exact full-text match, then shortest text (most specific label)
+  const exact = candidates.find(({ el }) => {
+    const t = (el.text ?? '').toLowerCase().trim();
+    return lower.join(' ') === t || (lower.length === 1 && lower[0] === t);
+  });
+  const { el } = exact ?? candidates.sort((a, b) => (a.el.text?.length ?? 0) - (b.el.text?.length ?? 0))[0];
+
+  const action = inferActionFromElement(el);
+  logger.info(`[label-match] tag=${el.tag} type=${el.type ?? ''} role=${el.role ?? ''} text="${el.text}" id="${el.id ?? ''}" → action=${action.kind}`);
+  return { selector: el.selector, action };
+}
+
+type DomActionResult = {
+  steps: Array<{ selector: string; action: DomAction; verifyText?: string; verifyHref?: string }>;
+  postMsg?: string; // optional message to speak after all steps are done
+};
+
+async function resolveDomAction(
+  task: string,
+  elements: DomElement[],
+): Promise<DomActionResult | null> {
+  const client = getClient();
+
+  let intent = classifyDomIntent(task);
+  // Quando o regex é ambíguo, pergunta à IA qual é o intent correto antes de filtrar
+  if (intent === 'unknown') {
+    intent = await resolveAiDomIntent(task);
+  }
+
+  // Para tarefas de click: usa visão para identificar o texto do elemento alvo,
+  // depois compara diretamente contra o snapshot de elementos já coletados (sem nova
+  // travessia do DOM, evitando reciclagem de nós no virtual scroll do YouTube/TikTok).
+  let visionKeywords: string[] = [];
+  if (intent === 'click') {
+    try {
+      const capture = await captureScreen();
+      const vision = await identifyClickTargetViaVision(task, capture);
+      visionKeywords = vision.keywords;
+
+      if (vision.phrase && vision.keywords.length > 0) {
+        // ── Fase 1: correspondência direta no snapshot de elements ─────────────
+        // Pontua cada elemento por quantas palavras da frase aparecem no texto/ariaLabel.
+        // Não faz nova travessia do DOM — usa o snapshot que já temos.
+        const phraseWords = vision.keywords; // já filtrados de stop words
+        logger.info(`[dom-find] buscando no snapshot por: [${phraseWords.join(', ')}]`);
+
+        let bestSnap: { el: DomElement; score: number } | null = null;
+        for (const el of elements) {
+          const hay = [el.text, el.ariaLabel, el.id, el.name]
+            .filter(Boolean).join(' ').toLowerCase();
+          if (!hay) continue;
+          const score = phraseWords.reduce((acc, w) => acc + (hay.includes(w) ? 1 : 0), 0);
+          if (!bestSnap || score > bestSnap.score) bestSnap = { el, score };
+        }
+
+        const minScore = Math.max(1, Math.ceil(phraseWords.length * 0.4));
+        if (bestSnap && bestSnap.score >= minScore) {
+          const el = bestSnap.el;
+          logger.info(`[vision-match] score=${bestSnap.score}/${phraseWords.length} tag=${el.tag} text="${el.text}" href="${el.href ?? ''}"`);
+          return { steps: [{ selector: el.selector, action: { kind: 'click' }, verifyText: el.text || el.ariaLabel, verifyHref: el.href }] };
+        }
+
+        // ── Fase 2: fallback — pede extensão para buscar com synonyms ──────────
+        logger.info(`[dom-find] snapshot sem match suficiente (score=${bestSnap?.score ?? 0}/${phraseWords.length}) — tentando dom_find_and_execute`);
+        try {
+          const expandedKeywords = expandWithSynonyms(visionKeywords);
+          const anyOf = visionKeywords.map(kw => expandWithSynonyms([kw]));
+          const found = await findDomAndExecute(visionKeywords, { kind: 'click' }, 8000, anyOf);
+          if (found.length > 0) {
+            const best = found[0];
+            logger.info(`[dom-find-execute] clicou: tag=${best.tag} text="${best.text}"`);
+            return { steps: [] };
+          }
+          logger.info(`[dom-find] sem resultado — caindo para DOM completo`);
+        } catch (err: any) {
+          logger.warn(`[dom-find] falhou: ${err.message}`);
+        }
+      }
+    } catch (err: any) {
+      logger.warn(`[vision-click] captura de tela falhou: ${err.message}`);
+    }
+  }
+
+  const { filtered, offsetMap, highConfidence } = smartFilterElements(elements, intent, task, visionKeywords);
+  logger.info(`[dom-resolve] intent=${intent}, highConfidence=${highConfidence}, candidatos: ${filtered.length}/${elements.length}`);
+
+  // High-confidence shortcut: skip AI entirely
+  if (highConfidence) {
+    if (intent === 'search' && filtered.length === 2) {
+      const regexValue = extractTypingValue(task);
+      const value = regexValue ?? await extractSearchTermViaAI(task);
+      const inputEl = filtered[0];
+      const submitEl = filtered[1];
+      logger.info(`[dom-resolve] fast-path search: type "${value}" → [${offsetMap[0]}] "${inputEl.placeholder ?? inputEl.ariaLabel ?? inputEl.id}" | click → [${offsetMap[1]}] "${submitEl.text ?? submitEl.ariaLabel ?? submitEl.id}"`);
+      return { steps: [
+        { selector: inputEl.selector, action: { kind: 'type', value, clearFirst: true } },
+        { selector: submitEl.selector, action: { kind: 'click' } },
+      ] };
+    }
+    if (intent === 'click' && filtered.length === 1) {
+      const el = filtered[0];
+      logger.info(`[dom-resolve] fast-path click: [${offsetMap[0]}] text="${el.text}" aria="${el.ariaLabel ?? ''}"`);
+      return { steps: [{ selector: el.selector, action: { kind: 'click' }, verifyText: el.text || el.ariaLabel, verifyHref: el.href }] };
+    }
+  }
+
+  // Build element summary for AI (filtered candidates only)
+  const elemSummary = filtered.map((el, i) =>
+    `[${i}] tag=${el.tag}${el.type ? ` type=${el.type}` : ''}${el.role ? ` role=${el.role}` : ''} text="${el.text}" id="${el.id ?? ''}" name="${el.name ?? ''}" placeholder="${el.placeholder ?? ''}" aria="${el.ariaLabel ?? ''}"${el.href ? ` href="${el.href}"` : ''}${el.options ? ` options=[${el.options.slice(0, 8).join(', ')}]` : ''}`,
+  ).join('\n');
+
+  const isFillForm = intent === 'fill_form';
+  const completion = await client.chat.completions.create({
+    model: 'llama-3.1-8b-instant',
+    messages: [
+      {
+        role: 'system',
+        content: `OUTPUT RULE: respond with ONLY a raw JSON array or the word null. No explanations, no code, no markdown.
+
+Given a web automation task and a list of interactive page elements, output a JSON array of steps.
+
+Each step is one of:
+- {"index": <number>, "action": {"kind": "click"}}
+- {"index": <number>, "action": {"kind": "submit"}}
+- {"index": <number>, "action": {"kind": "select", "value": "<option>"}}
+- {"index": <number>, "action": {"kind": "type", "value": "<text>", "clearFirst": true}}
+
+RULES:
+- "type" targets: input[type=text/email/password/tel/url/date/number/search] or textarea. NEVER a button.
+  - For input[type=date]: value MUST be in YYYY-MM-DD format (e.g. "1990-05-15").
+- "click" targets: button, link (tag=a), role=button, role=radio, input[type=radio], input[type=checkbox]. NEVER a plain text input.
+- "select" targets: tag=select. value = one of the options listed.
+- For radio buttons (type=radio): pick EXACTLY ONE per name group and use "click". NEVER include two radio inputs that share the same name attribute — that would overwrite the first selection. Pick the first option if the task doesn't specify.
+- For checkboxes (type=checkbox): use "click" for EVERY checkbox in the form. Check ALL of them.
+- For search tasks: exactly TWO steps — (1) type into search input, (2) click search/submit button.
+- For single click/select tasks: exactly ONE step.
+- For form fill tasks: output ONE step per field — fill ALL visible form fields (including radio and checkbox) with realistic fictional data, then end with a submit/click button step.
+- Output null if nothing matches.`,
+      },
+      {
+        role: 'user',
+        content: `Task: "${task}"\n\nElements:\n${elemSummary}\n\nJSON array only:`,
+      },
+    ],
+    max_tokens: isFillForm ? 900 : 120,
+    temperature: 0,
+  });
+
+  const raw = (completion.choices[0]?.message?.content ?? '').trim();
+  logger.info(`[dom-resolve] resposta IA: ${raw}`);
+
+  if (!raw || raw === 'null') return null;
+
+  const candidates = [raw, (raw.match(/\[[\s\S]*?\]/) ?? [])[0] ?? ''];
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate) as Array<{ index: number; action: DomAction }>;
+      if (!Array.isArray(parsed) || parsed.length === 0) continue;
+      const steps: Array<{ selector: string; action: DomAction; isSubmitButton: boolean }> = [];
+      const seenSelectors = new Set<string>();
+      const seenRadioNames = new Set<string>(); // deduplicate radio groups by name
+      for (const step of parsed) {
+        if (typeof step.index !== 'number' || !step.action) continue;
+        const origIdx = offsetMap[step.index] ?? step.index;
+        const el = elements[origIdx] ?? filtered[step.index];
+        if (!el) continue;
+
+        // Deduplicate: skip if same selector already queued
+        if (seenSelectors.has(el.selector)) continue;
+        seenSelectors.add(el.selector);
+
+        // Deduplicate radio groups: only the first radio per name group is kept.
+        // If the AI incorrectly sends both "masculino" and "feminino" (same name="sexo"),
+        // the second one is dropped here so we don't overwrite the first selection.
+        if (el.type === 'radio' && el.name) {
+          if (seenRadioNames.has(el.name)) {
+            logger.warn(`[dom-resolve] ignorando radio duplicado: name="${el.name}" id="${el.id ?? ''}" — já selecionado um desta grupo`);
+            continue;
+          }
+          seenRadioNames.add(el.name);
+        }
+
+        // Reject type action on non-input elements
+        const isInput = el.tag === 'input' || el.tag === 'textarea';
+        if (step.action.kind === 'type' && !isInput) {
+          logger.warn(`[dom-resolve] rejeitando: type em tag=${el.tag} text="${el.text}"`);
+          continue;
+        }
+
+        // A step is a "submit button" only when it's a <button> or input[type=submit/button].
+        // Radio and checkbox inputs also use kind='click' but must NOT be stripped.
+        const isSubmitButton =
+          el.tag === 'button' ||
+          (el.tag === 'input' && (el.type === 'submit' || el.type === 'button'));
+
+        logger.info(`[dom-resolve] passo: [${step.index}→${origIdx}] tag=${el.tag}${el.type ? ` type=${el.type}` : ''} text="${el.text}" id="${el.id ?? ''}" placeholder="${el.placeholder ?? ''}" action=${step.action.kind}`);
+        steps.push({ selector: el.selector, action: step.action, isSubmitButton });
+      }
+      if (steps.length > 0) {
+        // For fill_form: strip submit/button steps so user can confirm before sending.
+        // Only strip actual submit buttons — radio/checkbox clicks must be kept.
+        if (isFillForm) {
+          const wantsSubmit = /enviar|submete|clique.*cadastrar|clique.*enviar|click.*submit/i.test(task);
+          const skipSubmit = !wantsSubmit;
+          const filtered2 = skipSubmit
+            ? steps.filter(s => !(s.isSubmitButton && (s.action.kind === 'click' || s.action.kind === 'submit')))
+            : steps;
+          const postMsg = skipSubmit
+            ? 'Formulário preenchido! Quando quiser enviar, diga \'enviar o formulário\' ou clique no botão.'
+            : 'Feito!';
+          return { steps: filtered2.length > 0 ? filtered2 : steps.filter(s => !s.isSubmitButton), postMsg };
+        }
+        return { steps };
+      }
+    } catch {
+      // try next candidate
+    }
+  }
+  return null;
+}
+
+// ── File system action resolver ──────────────────────────────────────────────
+
+import type { FileSystemAction } from './context';
+
+async function resolveFileSystemAction(task: string): Promise<FileSystemAction | null> {
+  const client = getClient();
+
+  const completion = await client.chat.completions.create({
+    model: 'llama-3.1-8b-instant',
+    messages: [
+      {
+        role: 'system',
+        content: `Você interpreta comandos de voz para operações no sistema de arquivos do Windows.
+Retorne SOMENTE um JSON com:
+- "kind": "create_file" | "create_folder" | "open_folder" | "list_folder" | "delete" | "rename"
+- "path": caminho completo (use C:/Users/<usuario> como base se não especificado, desconhecido use C:/Users)
+- "content": conteúdo do arquivo (apenas para create_file, opcional)
+- "newName": novo nome (apenas para rename)
+
+Se o comando não for uma operação de arquivo, retorne null.
+
+Exemplos:
+- "cria um arquivo chamado teste.txt na área de trabalho" → {"kind":"create_file","path":"C:/Users/euzebio/Desktop/teste.txt","content":""}
+- "abre a pasta Downloads" → {"kind":"open_folder","path":"C:/Users/euzebio/Downloads"}
+- "lista os arquivos da pasta documentos" → {"kind":"list_folder","path":"C:/Users/euzebio/Documents"}
+- "cria uma pasta chamada projetos em documentos" → {"kind":"create_folder","path":"C:/Users/euzebio/Documents/projetos"}`,
+      },
+      { role: 'user', content: task },
+    ],
+    max_tokens: 150,
+    temperature: 0,
+  });
+
+  const raw = (completion.choices[0]?.message?.content ?? '').trim();
+  logger.info(`[fs-resolve] resposta: ${raw}`);
+  if (raw === 'null' || !raw) return null;
+
+  try {
+    return JSON.parse(raw) as FileSystemAction;
+  } catch {
+    return null;
+  }
+}
+
 // ── Layered orchestrator ─────────────────────────────────────────────────────
 
 async function speakWithState(text: string, win: BrowserWindow): Promise<void> {
@@ -559,39 +1288,68 @@ export async function processLayeredMessage(
   text: string,
   win: BrowserWindow,
 ): Promise<{ text: string; action?: string }> {
-  try {
-    logger.info(`[pipeline] tarefa recebida: "${text}"`);
+  const now = Date.now();
+  const taskKey = (text ?? '').toLowerCase().trim().replace(/\s+/g, ' ');
+  const last = recentTaskTimestamps.get(taskKey) ?? 0;
+  const taskId = `${now}-${Math.random().toString(36).slice(2)}`;
 
-    // Wake word check — known Whisper pt-BR variants of "Bruno"
-    const WAKE_VARIANTS = ['bruno', 'bruna', 'buno'];
+  logger.info(`[pipeline] taskId=${taskId} tarefa recebida: "${text}" taskKey="${taskKey}"`);
+
+  if (activeTaskKeys.has(taskKey)) {
+    logger.warn(`[pipeline] taskId=${taskId} — tarefa duplicada detectada: já em execução — ignorando.`);
+    return { text: 'Tarefa já em execução, ignorando.' };
+  }
+  if (now - last < DUPLICATE_WINDOW_MS) {
+    logger.warn(`[pipeline] taskId=${taskId} — debounce: mesma tarefa recebida há ${now - last}ms — ignorando.`);
+    recentTaskTimestamps.set(taskKey, now);
+    return { text: 'Tarefa repetida detectada — ignorando.' };
+  }
+
+  activeTaskKeys.add(taskKey);
+  recentTaskTimestamps.set(taskKey, now);
+
+  try {
+
     const lower = text.toLowerCase();
-    if (!WAKE_VARIANTS.some(w => lower.startsWith(w) || lower.includes(` ${w}`) || lower.includes(`,${w}`))) {
-      logger.info('[pipeline] wake word "Bruno" não encontrado, ignorando');
-      return { text: '' };
-    }
 
     // Browser navigation shortcuts — regex heuristic, no LLM needed, instant & precise
-    const BROWSER_NAV: Array<{ pattern: RegExp; combo: string; speech: string }> = [
-      { pattern: /voltar|volta|anterior|p[aá]gina anterior|page back|go back/i,   combo: 'alt+left',  speech: 'Voltando para a página anterior.' },
-      { pattern: /avan[çc]ar?|pr[oó]xima p[aá]gina|p[aá]gina seguinte|go forward/i, combo: 'alt+right', speech: 'Avançando para a próxima página.' },
-      { pattern: /recarreg|atualiz|refresh|reload|f5/i,                            combo: 'f5',        speech: 'Recarregando a página.' },
-      { pattern: /fechar\s*(a\s*)?aba|close\s*tab/i,                               combo: 'ctrl+w',    speech: 'Fechando a aba.' },
-      { pattern: /nova\s*aba|abrir\s*aba|new\s*tab/i,                              combo: 'ctrl+t',    speech: 'Abrindo nova aba.' },
+    type BrowserNavEntry = { pattern: RegExp; extAction?: 'new_tab' | 'close_tab' | 'reload' | 'go_back' | 'go_forward'; combo: string; speech: string };
+    const BROWSER_NAV: BrowserNavEntry[] = [
+      { pattern: /voltar|volta|anterior|p[aá]gina anterior|page back|go back/i,   extAction: 'go_back',    combo: 'alt+left',  speech: 'Voltando para a página anterior.' },
+      { pattern: /avan[çc]ar?|pr[oó]xima p[aá]gina|p[aá]gina seguinte|go forward/i, extAction: 'go_forward', combo: 'alt+right', speech: 'Avançando para a próxima página.' },
+      { pattern: /recarreg|atualiz|refresh|reload|f5/i,                            extAction: 'reload',     combo: 'f5',        speech: 'Recarregando a página.' },
+      { pattern: /fechar\s*(a\s*)?(?:aba|guia)|close\s*tab/i,                    extAction: 'close_tab',  combo: 'ctrl+w',    speech: 'Fechando a aba.' },
+      { pattern: /nov[ao]\s*(?:aba|guia)|abri[rr]?\s*(?:uma\s*)?(?:nov[ao]\s*)?(?:aba|guia)|new\s*tab/i, extAction: 'new_tab', combo: 'ctrl+t', speech: 'Abrindo nova aba.' },
     ];
     for (const nav of BROWSER_NAV) {
       if (nav.pattern.test(lower)) {
-        logger.info(`[pipeline] atalho de navegação detectado: "${nav.combo}"`);
-        await pressKeyCombo(nav.combo);
+        logger.info(`[pipeline] atalho de navegação detectado: "${nav.extAction ?? nav.combo}"`);
+        let usedExtension = false;
+        if (nav.extAction && isBrowserExtensionConnected()) {
+          // Use Chrome Tab API directly — no window focus required
+          try {
+            await requestBrowserAction(nav.extAction);
+            usedExtension = true;
+          } catch (err: any) {
+            logger.warn(`[pipeline] browser_action falhou (${err.message}) — usando atalho de teclado`);
+          }
+        }
+        if (!usedExtension) {
+          if (nav.extAction === 'new_tab') {
+            await openNewBrowserTab();
+          } else {
+            await focusBrowserWindow();
+            await pressKeyCombo(nav.combo);
+          }
+        }
         await speakWithState(nav.speech, win);
         return { text: nav.speech };
       }
     }
 
-    // Layer 0: clean transcription — strip background audio, normalize Bruno variants
-    const task = await normalizeTranscription(text);
-    logger.info(`[pipeline] tarefa normalizada: "${task}"`);
+    const task = text;
 
-    // Layer 0b: coherence check — reject background noise / nonsensical phrases
+    // Layer 0b: coherence check — reject noise / nonsensical phrases
     const isCoherent = await checkIfTaskIsCoherent(task);
     if (!isCoherent) {
       logger.info(`[pipeline] tarefa incoerente descartada: "${task}"`);
@@ -605,6 +1363,86 @@ export async function processLayeredMessage(
       logger.info('[pipeline] caminho direto → ação de SO (sem captura de tela)');
       return processTranscription(task, win);
     }
+
+    // Layer 1b: is this only a description request (no action/click needed)?
+    // Run early so we can skip the DOM path entirely for description-only tasks.
+    const needsInteraction = await checkIfTaskNeedsInteraction(task);
+    if (!needsInteraction) {
+      logger.info('[pipeline] layer1b → tarefa de descrição apenas, pulando DOM');
+    }
+
+    // ── Detect active window context ─────────────────────────────────────────
+    const activeWin = await getActiveWindow();
+    logger.info(`[pipeline] janela ativa: ${activeWin?.processName ?? 'desconhecida'} — browser=${activeWin?.isBrowser} explorer=${activeWin?.isExplorer}`);
+
+    // ── Path A: Browser + extension connected → DOM automation ───────────────
+    // Wait up to 3 s for the extension to (re)connect — Chrome MV3 service workers
+    // can be killed silently and need a moment to restart and reconnect.
+    // Skip if this is a description-only task — no DOM interaction needed.
+    const extConnected = needsInteraction && await waitForExtension(3000);
+    if (extConnected) {
+      logger.info('[pipeline] caminho DOM → extensão do navegador');
+      const waitMsg = 'Aguarde um momento enquanto executo a atividade...';
+      win.webContents.send('show-message', waitMsg);
+      speak(waitMsg, () => win.webContents.send('character-state', 'talking')).then(() => win.webContents.send('character-state', 'idle'));
+
+      try {
+        const elements = await queryDom(task);
+        logger.info(`[pipeline] taskId=${taskId} DOM retornou ${elements.length} elemento(s)`);
+
+        if (elements.length === 0) {
+          const msg = 'Não encontrei o elemento na página atual.';
+          await speakWithState(msg, win);
+          return { text: msg };
+        }
+
+        // Use Groq text model to decide which element to interact with and how
+        const domResult = await resolveDomAction(task, elements);
+        if (!domResult) {
+          const msg = 'Não consegui determinar a ação a executar.';
+          await speakWithState(msg, win);
+          return { text: msg };
+        }
+
+        for (let i = 0; i < domResult.steps.length; i++) {
+          const step = domResult.steps[i];
+          logger.info(`[dom-execute-start] taskId=${taskId} passo ${i + 1}/${domResult.steps.length} selector="${step.selector}" action=${step.action.kind}`);
+          await executeDomAction(step.selector, step.action, 8000, step.verifyText, step.verifyHref);
+          logger.info(`[dom-execute-done] taskId=${taskId} passo ${i + 1}/${domResult.steps.length} OK`);
+        }
+        const doneMsg = domResult.postMsg ?? 'Feito!';
+        await speakWithState(doneMsg, win);
+        return { text: doneMsg, action: 'dom_automation' };
+      } catch (err: any) {
+        const isRestrictedPage = /chrome_restricted_url|cannot access a chrome:\/\//i.test(err.message);
+        if (isRestrictedPage) {
+          logger.info('[pipeline] extensão em página restrita (chrome://) — tratando como ação de SO');
+          return processTranscription(task, win);
+        }
+        logger.warn(`[pipeline] extensão falhou (${err.message}) — caindo para visão por IA`);
+        // Falls through to vision AI below
+      }
+    } else {
+      logger.warn('[pipeline] extensão não conectada — verifique se a extensão está instalada e ativa no Chrome');
+    }
+
+    // ── Path B: File Explorer / file system commands ──────────────────────────
+    if (activeWin?.isExplorer || /pasta|diret[oó]rio|arquivo|criar.*(?:arquivo|pasta)|abri[rr].*pasta/i.test(task)) {
+      const fsAction = await resolveFileSystemAction(task);
+      if (fsAction) {
+        logger.info(`[pipeline] caminho sistema de arquivos → ${fsAction.kind}: ${fsAction.path}`);
+        try {
+          const result = await executeFileSystemAction(fsAction);
+          await speakWithState(result, win);
+          return { text: result, action: 'file_system' };
+        } catch (err: any) {
+          logger.warn(`[pipeline] ação de arquivo falhou: ${err.message}`);
+          // Falls through to vision AI
+        }
+      }
+    }
+
+    // ── Path C: Vision AI fallback ────────────────────────────────────────────
 
     // Layer 1: does this task need screen interaction?
     const needsScreen = await checkIfTaskNeedsScreen(task);
@@ -621,8 +1459,7 @@ export async function processLayeredMessage(
       win.webContents.send('character-state', 'idle');
     });
 
-    // Layer 1b: description or interaction?
-    const needsInteraction = await checkIfTaskNeedsInteraction(task);
+    // needsInteraction already determined above (layer1b)
 
     // Capture primary monitor
     logger.info('[pipeline] capturando tela do monitor primário...');
@@ -688,5 +1525,11 @@ export async function processLayeredMessage(
     await speakWithState(failMsg, win).catch(() => {});
     win.webContents.send('character-state', 'idle');
     return { text: failMsg };
+  } finally {
+    try {
+      activeTaskKeys.delete(taskKey);
+    } catch (e) {
+      // ignore
+    }
   }
 }

@@ -1,7 +1,7 @@
 // VAD thresholds
-const THRESHOLD_RMS = 0.030; // RMS level to consider as voice (higher = ignores quieter background)
+const THRESHOLD_RMS = 0.055; // RMS level to consider as voice (higher = ignores quieter background)
 const SILENCE_MS    = 1200;  // ms of silence before finalising a speech clip
-const MIN_SPEECH_MS = 600;   // clips shorter than this are discarded (filters accidental triggers)
+const MIN_SPEECH_MS = 900;   // clips shorter than this are discarded (filters accidental triggers)
 
 export class VadRecorder {
   private stream: MediaStream | null = null;

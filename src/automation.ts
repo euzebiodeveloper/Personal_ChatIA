@@ -18,6 +18,28 @@ const ALLOWED_KEYS = new Set([
 
 // Whitelisted app launchers per platform
 type PlatformCmds = { win32: string; darwin: string; linux: string };
+// Well-known web-only services — open_app with these names should open a URL
+const WEB_SERVICES: Record<string, string> = {
+  youtube:   'https://youtube.com',
+  netflix:   'https://netflix.com',
+  twitch:    'https://twitch.tv',
+  twitter:   'https://twitter.com',
+  x:         'https://x.com',
+  instagram: 'https://instagram.com',
+  facebook:  'https://facebook.com',
+  gmail:     'https://mail.google.com',
+  google:    'https://google.com',
+  github:    'https://github.com',
+  reddit:    'https://reddit.com',
+  amazon:    'https://amazon.com',
+  linkedin:  'https://linkedin.com',
+  tiktok:    'https://tiktok.com',
+  primevideo: 'https://primevideo.com',
+  disneyplus: 'https://disneyplus.com',
+  hotstar:   'https://hotstar.com',
+  globoplay: 'https://globoplay.globo.com',
+};
+
 const APP_LAUNCHERS: Record<string, PlatformCmds> = {
   // Browsers
   chrome:        { win32: 'start chrome',              darwin: 'open -a "Google Chrome"',           linux: 'google-chrome' },
@@ -66,7 +88,14 @@ export async function executeAction(
       try {
         const parsed = new URL(params.url);
         if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
-          await shell.openExternal(parsed.href);
+          const browser = (params.browser ?? 'chrome').toLowerCase().trim();
+          const browserLauncher = APP_LAUNCHERS[browser] ?? APP_LAUNCHERS['chrome'];
+          const plat = process.platform as keyof PlatformCmds;
+          const cmd = browserLauncher[plat] ?? browserLauncher.linux;
+          const urlArg = parsed.href.replace(/"/g, '');
+          await execAsync(`${cmd} "${urlArg}"`).catch((err) =>
+            console.warn('[automation] open_url failed:', err.message),
+          );
         }
       } catch {
         console.warn('[automation] Invalid URL:', params.url);
@@ -83,6 +112,11 @@ export async function executeAction(
         await execAsync(cmd).catch((err) =>
           console.warn('[automation] open_app failed:', err.message),
         );
+      } else if (WEB_SERVICES[appName]) {
+        // Website name passed to open_app — redirect to open_url
+        const webUrl = WEB_SERVICES[appName];
+        console.log(`[automation] open_app '${appName}' → redirecting to open_url ${webUrl}`);
+        await executeAction('open_url', { url: webUrl });
       } else if (process.platform === 'win32') {
         // Fallback: sanitize and try Start-Process (uses PATH + App Paths registry)
         const sanitized = appName.replace(/[^a-z0-9\s\-_.]/gi, '').trim();
@@ -154,6 +188,85 @@ async function pressKey(key: string): Promise<void> {
     };
     const xKey = linuxKeyMap[key] ?? key;
     await execAsync(`xdotool key ${xKey}`).catch(() => {});
+  }
+}
+
+export async function focusBrowserWindow(): Promise<void> {
+  if (process.platform === 'win32') {
+    // WScript.Shell.AppActivate is reliable at stealing focus on Windows — unlike
+    // SetForegroundWindow, it doesn't require the calling process to hold the foreground lock.
+    // Use -EncodedCommand (Base64 UTF-16LE) to safely pass a multi-line script without
+    // statement-separator issues that arise when collapsing newlines to spaces.
+    const ps = `
+$wsh = New-Object -ComObject WScript.Shell
+foreach ($title in @('Google Chrome','Microsoft Edge','Mozilla Firefox','Brave','Opera')) {
+  if ($wsh.AppActivate($title)) { break }
+}`;
+    const encoded = Buffer.from(ps, 'utf16le').toString('base64');
+    await execAsync(`powershell -NoProfile -NonInteractive -EncodedCommand ${encoded}`).catch(() => {});
+  } else if (process.platform === 'darwin') {
+    const script = `
+tell application "System Events"
+  set browserList to {"Google Chrome", "Microsoft Edge", "Firefox", "Brave Browser", "Opera"}
+  repeat with b in browserList
+    if (name of processes) contains b then
+      tell application b to activate
+      exit repeat
+    end if
+  end repeat
+end tell`;
+    await execAsync(`osascript -e '${script.replace(/'/g, "\\'")}'`).catch(() => {});
+  }
+  // Linux: xdotool search handles focus automatically
+}
+
+/**
+ * Opens a new browser tab without requiring the browser window to be focused.
+ * Uses OS-level commands that target the running browser process directly.
+ */
+export async function openNewBrowserTab(): Promise<void> {
+  if (process.platform === 'win32') {
+    // Open a new tab in the running browser.
+    // If a browser is already open: focus it with AppActivate and send Ctrl+T — this is the
+    // only reliable way to add a tab to an existing window without spawning a new process.
+    // If no browser is running: launch Chrome which opens with a new tab by default.
+    // Use -EncodedCommand (Base64 UTF-16LE) to safely pass the multi-line script.
+    const ps = `
+$wsh = New-Object -ComObject WScript.Shell
+$names = @('chrome','msedge','firefox','brave','opera')
+$proc = Get-Process -Name $names -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+if ($proc) {
+  foreach ($title in @('Google Chrome','Microsoft Edge','Mozilla Firefox','Brave','Opera')) {
+    if ($wsh.AppActivate($title)) {
+      Start-Sleep -Milliseconds 200
+      $wsh.SendKeys('^t')
+      break
+    }
+  }
+} else {
+  Start-Process 'chrome'
+}`;
+    const encoded = Buffer.from(ps, 'utf16le').toString('base64');
+    await execAsync(`powershell -NoProfile -NonInteractive -EncodedCommand ${encoded}`).catch(() => {});
+  } else if (process.platform === 'darwin') {
+    const script = `
+tell application "System Events"
+  set browserList to {"Google Chrome", "Microsoft Edge", "Firefox", "Brave Browser", "Opera"}
+  repeat with b in browserList
+    if (name of processes) contains b then
+      if b is "Firefox" then
+        tell application b to open location "about:blank"
+      else
+        tell application b to make new tab at end of tabs of front window
+      end if
+      tell application b to activate
+      exit repeat
+    end if
+  end repeat
+end tell`;
+    await execAsync(`osascript -e '${script.replace(/'/g, "'\\''")}'`).catch(() => {});
+  } else {
+    await execAsync('xdg-open "about:blank"').catch(() => {});
   }
 }
 

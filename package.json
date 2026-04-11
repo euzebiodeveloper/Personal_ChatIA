@@ -42,11 +42,13 @@
     "@huggingface/transformers": "^4.0.1",
     "@picovoice/porcupine-web": "^4.0.0",
     "@picovoice/web-voice-processor": "^4.0.9",
+    "@types/ws": "^8.18.1",
     "dotenv": "^17.4.0",
     "electron-squirrel-startup": "^1.0.1",
     "openai": "^6.33.0",
     "pixi-live2d-display": "^0.4.0",
     "pixi.js": "^6.5.10",
-    "say": "^0.16.0"
+    "say": "^0.16.0",
+    "ws": "^8.20.0"
   }
 }
